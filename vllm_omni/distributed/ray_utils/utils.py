@@ -159,7 +159,6 @@ def start_ray_actor(
     placement_group,
     placement_group_bundle_index: int,
     *args,
-    ray_workers_use_nsight: bool = False,
     **kwargs,
 ):
     if not RAY_AVAILABLE:
@@ -170,19 +169,11 @@ def start_ray_actor(
         def run(self, func, *args, **kwargs):
             return func(*args, **kwargs)
 
-    runtime_env = {"env_vars": {"PYTHONPATH": os.environ.get("PYTHONPATH", "")}, "CUDA_LAUNCH_BLOCKING": "1"}
-    if ray_workers_use_nsight:
-        runtime_env["nsight"] = {
-            "t": "cuda,cudnn,cublas",
-            "o": "'worker_process_%p'",
-            "cuda-graph-trace": "node",
-        }
-
     worker_actor = OmniStageRayWorker.options(
         scheduling_strategy=PlacementGroupSchedulingStrategy(
             placement_group=placement_group, placement_group_bundle_index=placement_group_bundle_index
         ),
-        runtime_env=runtime_env,
+        runtime_env={"env_vars": {"PYTHONPATH": os.environ.get("PYTHONPATH", "")}, "CUDA_LAUNCH_BLOCKING": "1"},
     ).remote()
 
     worker_actor.run.remote(worker_entry_fn, *args, **kwargs)

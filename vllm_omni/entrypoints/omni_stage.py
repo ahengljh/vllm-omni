@@ -221,7 +221,6 @@ class OmniStage:
         batch_timeout: int = 10,
         connectors_config: dict | None = None,
         worker_backend: str = "multi_process",
-        ray_workers_use_nsight: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize and start the stage worker process.
@@ -237,7 +236,6 @@ class OmniStage:
             batch_timeout: Timeout in seconds for batching requests
             connectors_config: Configuration for stage connectors
             worker_backend: Backend type ("multi_process" or "ray")
-            ray_workers_use_nsight: Enable Nsight Systems profiling for Ray stage workers.
             **kwargs: Additional arguments (e.g. ray_placement_group)
 
         Raises:
@@ -279,7 +277,6 @@ class OmniStage:
                         stage_payload=stage_payload,
                         batch_timeout=batch_timeout,
                         stage_init_timeout=self._stage_init_timeout,
-                        ray_workers_use_nsight=ray_workers_use_nsight,
                     )
                 else:
                     self._ray_actor = start_ray_actor(
@@ -292,7 +289,6 @@ class OmniStage:
                         out_q=self._out_q,
                         batch_timeout=batch_timeout,
                         stage_init_timeout=self._stage_init_timeout,
-                        ray_workers_use_nsight=ray_workers_use_nsight,
                     )
             else:
                 if is_async:
