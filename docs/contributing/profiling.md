@@ -77,7 +77,44 @@ async for output in async_omni.generate(prompt, sampling_params, request_id):
 await async_omni.stop_profile()
 ```
 
-**4. Analyzing Omni Traces**
+**4. Profile with NVIDIA Nsight Systems**
+
+Nsight Systems provides low-level CUDA kernel timing and API traces. Install it using
+the NVIDIA instructions: https://docs.nvidia.com/nsight-systems/InstallationGuide/index.html
+
+**Tip**: When profiling with `nsys`, set `VLLM_WORKER_MULTIPROC_METHOD=spawn` to avoid
+issues with fork-based workers (see Nsight Systems release notes).
+
+**Offline example**
+```bash
+nsys profile \
+  --trace-fork-before-exec=true \
+  --cuda-graph-trace=node \
+  python examples/offline_inference/qwen2_5_omni/end2end.py
+```
+
+**Server example**
+```bash
+nsys profile \
+  --trace-fork-before-exec=true \
+  --cuda-graph-trace=node \
+  vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091
+```
+
+**Ray stage workers**
+When using the Ray backend for stage workers, enable Ray's Nsight integration so
+each worker is profiled:
+
+```bash
+vllm serve Qwen/Qwen2.5-Omni-7B \
+  --omni \
+  --worker-backend ray \
+  --ray-workers-use-nsight
+```
+
+Nsight traces will be written per worker (for example, `worker_process_<pid>.nsys-rep`).
+
+**5. Analyzing Omni Traces**
 
 After ``stop_profile()`` completes (and the file write wait time has passed), the directory specified in ```VLLM_TORCH_PROFILER_DIR``` will contain the trace files.
 
