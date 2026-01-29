@@ -736,6 +736,45 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     return StreamingResponse(content=generator, media_type="text/event-stream")
 
 
+@router.post("/start_profile")
+async def start_profile(raw_request: Request) -> JSONResponse:
+    """Start profiling on all stages.
+
+    When the server is running under nsys with
+    ``--capture-range=cudaProfilerApi``, this also opens the CUDA
+    profiler capture region.
+    """
+    engine_client = raw_request.app.state.engine_client
+    try:
+        await engine_client.start_profile()
+    except Exception as e:
+        logger.exception("Failed to start profile: %s", e)
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            detail=str(e),
+        ) from e
+    return JSONResponse(content={"status": "ok"})
+
+
+@router.post("/stop_profile")
+async def stop_profile(raw_request: Request) -> JSONResponse:
+    """Stop profiling on all stages.
+
+    When running under nsys, this closes the CUDA profiler capture
+    region so nsys finalises the current capture.
+    """
+    engine_client = raw_request.app.state.engine_client
+    try:
+        await engine_client.stop_profile()
+    except Exception as e:
+        logger.exception("Failed to stop profile: %s", e)
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            detail=str(e),
+        ) from e
+    return JSONResponse(content={"status": "ok"})
+
+
 _remove_route_from_router(router, "/v1/audio/speech", {"POST"})
 
 
