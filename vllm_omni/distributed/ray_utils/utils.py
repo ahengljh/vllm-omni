@@ -154,11 +154,30 @@ def kill_ray_actor(actor):
             logger.warning(f"Failed to kill actor: {e}")
 
 
+def _configure_ray_workers_use_nsight(ray_remote_kwargs: dict) -> dict:
+    """Add Nsight Systems profiling config to Ray runtime_env.
+
+    See https://docs.ray.io/en/latest/ray-observability/user-guides/profiling.html#profiling-nsight-profiler
+    """
+    runtime_env = ray_remote_kwargs.setdefault("runtime_env", {})
+    runtime_env.update(
+        {
+            "nsight": {
+                "t": "cuda,cudnn,cublas",
+                "o": "'worker_process_%p'",
+                "cuda-graph-trace": "node",
+            }
+        }
+    )
+    return ray_remote_kwargs
+
+
 def start_ray_actor(
     worker_entry_fn,
     placement_group,
     placement_group_bundle_index: int,
     *args,
+    ray_workers_use_nsight: bool = False,
     **kwargs,
 ):
     if not RAY_AVAILABLE:
@@ -169,12 +188,17 @@ def start_ray_actor(
         def run(self, func, *args, **kwargs):
             return func(*args, **kwargs)
 
-    worker_actor = OmniStageRayWorker.options(
-        scheduling_strategy=PlacementGroupSchedulingStrategy(
+    ray_remote_kwargs = {
+        "scheduling_strategy": PlacementGroupSchedulingStrategy(
             placement_group=placement_group, placement_group_bundle_index=placement_group_bundle_index
         ),
-        runtime_env={"env_vars": {"PYTHONPATH": os.environ.get("PYTHONPATH", "")}, "CUDA_LAUNCH_BLOCKING": "1"},
-    ).remote()
+        "runtime_env": {"env_vars": {"PYTHONPATH": os.environ.get("PYTHONPATH", "")}, "CUDA_LAUNCH_BLOCKING": "1"},
+    }
+
+    if ray_workers_use_nsight:
+        _configure_ray_workers_use_nsight(ray_remote_kwargs)
+
+    worker_actor = OmniStageRayWorker.options(**ray_remote_kwargs).remote()
 
     worker_actor.run.remote(worker_entry_fn, *args, **kwargs)
 

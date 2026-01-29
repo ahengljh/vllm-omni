@@ -80,6 +80,7 @@ class AsyncOmni(OmniBase):
               for IPC. Objects larger than this threshold will use shared memory.
             - worker_backend: Backend for worker processes. Default is "multi_process".
             - ray_address: Address of Ray cluster for Ray backend, if using Ray backend.
+            - ray_workers_use_nsight: Enable Nsight Systems profiling for Ray stage workers.
             - batch_timeout: Timeout in seconds for batching requests within a stage
             - init_timeout: Timeout in seconds for waiting for all stages to initialize
             - Additional keyword arguments passed to stage engines.

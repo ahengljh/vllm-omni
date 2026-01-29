@@ -95,6 +95,7 @@ class OmniBase:
               for IPC. Objects larger than this threshold will use shared memory.
             - worker_backend: Backend for worker processes. Default is "multi_process".
             - ray_address: Address of Ray cluster for Ray backend, if using Ray backend.
+            - ray_workers_use_nsight: Enable Nsight Systems profiling for Ray stage workers.
             - batch_timeout: Timeout in seconds for batching requests within a stage
             - init_timeout: Timeout in seconds for waiting for all stages to initialize
             - Additional keyword arguments passed to stage engines.
@@ -194,6 +195,7 @@ class OmniBase:
         init_timeout = kwargs.get("init_timeout", 300)
         worker_backend = kwargs.get("worker_backend", "multi_process")
         ray_address = kwargs.get("ray_address", None)
+        ray_workers_use_nsight = bool(kwargs.get("ray_workers_use_nsight", False))
         batch_timeout = kwargs.get("batch_timeout", 10)
         stage_configs_path = kwargs.get("stage_configs_path", None)
         log_stats = kwargs.get("log_stats", False)
@@ -244,6 +246,7 @@ class OmniBase:
 
         self.worker_backend = worker_backend
         self.ray_address = ray_address
+        self.ray_workers_use_nsight = ray_workers_use_nsight
         self.batch_timeout = batch_timeout
         # async chunk remains the same for each stage
         self.async_chunk = self._is_async_chunk_enable(self.stage_configs)
@@ -321,6 +324,7 @@ class OmniBase:
                 batch_timeout=self.batch_timeout,
                 connectors_config=stage_connectors_config,
                 worker_backend=self.worker_backend,
+                ray_workers_use_nsight=self.ray_workers_use_nsight,
                 ray_placement_group=self._ray_pg,
             )
 
@@ -508,6 +512,7 @@ class Omni(OmniBase):
               for IPC. Objects larger than this threshold will use shared memory.
             - worker_backend: Backend for worker processes. Default is "multi_process".
             - ray_address: Address of Ray cluster for Ray backend, if using Ray backend.
+            - ray_workers_use_nsight: Enable Nsight Systems profiling for Ray stage workers.
             - batch_timeout: Timeout in seconds for batching requests within a stage
             - init_timeout: Timeout in seconds for waiting for all stages to initialize
             - Additional keyword arguments passed to stage engines.

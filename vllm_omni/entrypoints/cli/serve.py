@@ -136,6 +136,12 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="The address of the Ray cluster to connect to.",
         )
+        omni_config_group.add_argument(
+            "--ray-workers-use-nsight",
+            action="store_true",
+            default=False,
+            help="Enable Nsight Systems profiling for Ray stage workers.",
+        )
 
         # Diffusion model specific arguments
         omni_config_group.add_argument(
