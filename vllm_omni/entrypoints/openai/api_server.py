@@ -140,6 +140,52 @@ class _DiffusionServingModels:
 # Server entry points
 
 
+def _register_profiling_routes(app) -> None:
+    """Register /start_profile and /stop_profile directly on the app.
+
+    These are registered on the app (not the module-level router) to
+    guarantee availability regardless of how vllm's build_app() handles
+    router inclusion.
+    """
+
+    @app.post("/start_profile")
+    async def start_profile(raw_request: Request) -> JSONResponse:
+        """Start profiling on all stages.
+
+        When the server is running under nsys with
+        ``--capture-range=cudaProfilerApi``, this also opens the CUDA
+        profiler capture region.
+        """
+        engine_client = raw_request.app.state.engine_client
+        try:
+            await engine_client.start_profile()
+        except Exception as e:
+            logger.exception("Failed to start profile: %s", e)
+            raise HTTPException(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                detail=str(e),
+            ) from e
+        return JSONResponse(content={"status": "ok"})
+
+    @app.post("/stop_profile")
+    async def stop_profile(raw_request: Request) -> JSONResponse:
+        """Stop profiling on all stages.
+
+        When running under nsys, this closes the CUDA profiler capture
+        region so nsys finalises the current capture.
+        """
+        engine_client = raw_request.app.state.engine_client
+        try:
+            await engine_client.stop_profile()
+        except Exception as e:
+            logger.exception("Failed to stop profile: %s", e)
+            raise HTTPException(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                detail=str(e),
+            ) from e
+        return JSONResponse(content={"status": "ok"})
+
+
 async def omni_run_server(args, **uvicorn_kwargs) -> None:
     """Run a single-worker API server.
 
@@ -182,6 +228,10 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         client_config=client_config,
     ) as engine_client:
         app = build_app(args)
+
+        # Register profiling endpoints directly on the app so they are
+        # available regardless of how vllm's build_app handles routers.
+        _register_profiling_routes(app)
 
         await omni_init_app_state(engine_client, app.state, args)
 
@@ -734,45 +784,6 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                         )
 
     return StreamingResponse(content=generator, media_type="text/event-stream")
-
-
-@router.post("/start_profile")
-async def start_profile(raw_request: Request) -> JSONResponse:
-    """Start profiling on all stages.
-
-    When the server is running under nsys with
-    ``--capture-range=cudaProfilerApi``, this also opens the CUDA
-    profiler capture region.
-    """
-    engine_client = raw_request.app.state.engine_client
-    try:
-        await engine_client.start_profile()
-    except Exception as e:
-        logger.exception("Failed to start profile: %s", e)
-        raise HTTPException(
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
-            detail=str(e),
-        ) from e
-    return JSONResponse(content={"status": "ok"})
-
-
-@router.post("/stop_profile")
-async def stop_profile(raw_request: Request) -> JSONResponse:
-    """Stop profiling on all stages.
-
-    When running under nsys, this closes the CUDA profiler capture
-    region so nsys finalises the current capture.
-    """
-    engine_client = raw_request.app.state.engine_client
-    try:
-        await engine_client.stop_profile()
-    except Exception as e:
-        logger.exception("Failed to stop profile: %s", e)
-        raise HTTPException(
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
-            detail=str(e),
-        ) from e
-    return JSONResponse(content={"status": "ok"})
 
 
 _remove_route_from_router(router, "/v1/audio/speech", {"POST"})
