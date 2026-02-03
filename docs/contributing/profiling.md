@@ -2,16 +2,64 @@
 
 > **Warning:** Profiling incurs significant overhead. Use only for development and debugging, never in production.
 
-vLLM-Omni uses the PyTorch Profiler to analyze performance across both **multi-stage omni-modality models** and **diffusion models**.
+vLLM-Omni supports two profiling approaches:
+- **Nsight Systems (nsys)** — GPU-level tracing during online serving via HTTP endpoints
+- **PyTorch Profiler** — detailed CPU/CUDA traces for offline inference scripts
 
-### 1. Set the Output Directory
-Before running any script, set this environment variable. The system detects this and automatically saves traces here.
+### 1. Nsight Systems Profiling for Online Serving
+
+NVIDIA Nsight Systems (`nsys`) can capture GPU-level traces while the server is running. The API server exposes `/start_profile` and `/stop_profile` HTTP endpoints that signal nsys via `torch.cuda.profiler.start()` / `stop()`.
+
+**Step 1 — Launch the server under nsys:**
+
+```bash
+nsys profile \
+  --capture-range=cudaProfilerApi \
+  --capture-range-end=repeat \
+  --trace-fork-before-exec=true \
+  --cuda-graph-trace=node \
+  vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091
+```
+
+`--capture-range=cudaProfilerApi` tells nsys to sit idle until `torch.cuda.profiler.start()` is called in a worker process. `--capture-range-end=repeat` allows multiple start/stop cycles in the same session.
+
+**Step 2 — Start profiling:**
+
+```bash
+curl -X POST http://localhost:8091/start_profile
+```
+
+**Step 3 — Send requests:**
+
+```bash
+curl -X POST http://localhost:8091/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"Qwen/Qwen2.5-Omni-7B","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+**Step 4 — Stop profiling:**
+
+```bash
+curl -X POST http://localhost:8091/stop_profile
+```
+
+**Step 5 — Shut down the server** (Ctrl+C). nsys writes a `.nsys-rep` file in the current directory.
+
+```bash
+ls *.nsys-rep
+nsys stats report1.nsys-rep
+```
+
+Open the `.nsys-rep` file in the Nsight Systems GUI for a detailed timeline of CUDA kernels, memory operations, and NVTX ranges.
+
+### 2. Set the Output Directory (PyTorch Profiler)
+Before running any offline profiling script, set this environment variable. The system detects this and automatically saves traces here.
 
 ```bash
 export VLLM_TORCH_PROFILER_DIR=./profiles
 ```
 
-### 2. Profiling Omni-Modality Models
+### 3. Profiling Omni-Modality Models (Offline)
 
 It is best to limit profiling to one iteration to keep trace files manageable.
 
@@ -82,7 +130,7 @@ omni_llm.close()
 2. **Qwen3-Omni**:   [https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/qwen3_omni/end2end.py](https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/qwen3_omni/end2end.py)
 
 
-### 3. Profiling diffusion models
+### 4. Profiling Diffusion Models (Offline)
 
 Diffusion profiling is End-to-End, capturing encoding, denoising loops, and decoding.
 
@@ -130,55 +178,6 @@ python image_to_video.py \
 1. **Qwen image edit**:  [https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/image_to_image/image_edit.py](https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/image_to_image/image_edit.py)
 
 2. **Wan-AI/Wan2.2-I2V-A14B-Diffusers**:   [https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/image_to_video](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/image_to_video)
-
-> **Note:**
-The PyTorch Profiler (`start_profile()` / `stop_profile()`) is primarily designed for offline inference scripts. For online (server-mode) profiling, use Nsight Systems as described below.
-
-### 4. Nsight Systems Profiling for Online Serving
-
-NVIDIA Nsight Systems (`nsys`) can capture GPU-level traces while the server is running. The API server exposes `/start_profile` and `/stop_profile` HTTP endpoints that signal nsys via `torch.cuda.profiler.start()` / `stop()`.
-
-**Step 1 — Launch the server under nsys:**
-
-```bash
-nsys profile \
-  --capture-range=cudaProfilerApi \
-  --capture-range-end=repeat \
-  --trace-fork-before-exec=true \
-  --cuda-graph-trace=node \
-  vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091
-```
-
-`--capture-range=cudaProfilerApi` tells nsys to sit idle until `torch.cuda.profiler.start()` is called in a worker process. `--capture-range-end=repeat` allows multiple start/stop cycles in the same session.
-
-**Step 2 — Start profiling:**
-
-```bash
-curl -X POST http://localhost:8091/start_profile
-```
-
-**Step 3 — Send requests:**
-
-```bash
-curl -X POST http://localhost:8091/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"Qwen/Qwen2.5-Omni-7B","messages":[{"role":"user","content":"Hello"}]}'
-```
-
-**Step 4 — Stop profiling:**
-
-```bash
-curl -X POST http://localhost:8091/stop_profile
-```
-
-**Step 5 — Shut down the server** (Ctrl+C). nsys writes a `.nsys-rep` file in the current directory.
-
-```bash
-ls *.nsys-rep
-nsys stats report1.nsys-rep
-```
-
-Open the `.nsys-rep` file in the Nsight Systems GUI for a detailed timeline of CUDA kernels, memory operations, and NVTX ranges.
 
 ### 5. Analyzing Omni Traces
 

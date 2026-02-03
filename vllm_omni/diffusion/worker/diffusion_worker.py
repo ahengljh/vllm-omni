@@ -131,12 +131,30 @@ class DiffusionWorker:
 
     @classmethod
     def start_profile(cls, trace_path_template: str) -> str:
-        """Start profiling for this GPU worker."""
+        """Start profiling for this GPU worker.
+
+        Also opens a CUDA profiler capture region so that nsys (when
+        launched with ``--capture-range=cudaProfilerApi``) records GPU
+        activity from within this worker process.
+        """
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.profiler.start()
+            except Exception as e:
+                logger.warning("Failed to start CUDA profiler in DiffusionWorker: %s", e)
         return CurrentProfiler.start(trace_path_template)
 
     @classmethod
     def stop_profile(cls) -> dict | None:
-        """Stop profiling and return the result dictionary."""
+        """Stop profiling and return the result dictionary.
+
+        Also closes the CUDA profiler capture region for nsys.
+        """
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.profiler.stop()
+            except Exception as e:
+                logger.warning("Failed to stop CUDA profiler in DiffusionWorker: %s", e)
         return CurrentProfiler.stop()
 
     def execute_model(self, req: OmniDiffusionRequest, od_config: OmniDiffusionConfig) -> DiffusionOutput:
