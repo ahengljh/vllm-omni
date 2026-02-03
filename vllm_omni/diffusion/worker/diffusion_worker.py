@@ -10,10 +10,10 @@ to DiffusionModelRunner.
 import multiprocessing as mp
 import os
 from contextlib import AbstractContextManager, nullcontext
+from typing import Any
 
 import torch
 import zmq
-from typing import Any
 
 from vllm.config import VllmConfig
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
