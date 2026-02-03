@@ -238,7 +238,7 @@ class DiffusionEngine:
         logger.info("Stopping diffusion profiling...")
 
         try:
-            # Give workers enough time — trace flushing can be slow
+            # Give worker enough time — export + compression + table can be slow
             results = self.collective_rpc(method="stop_profile", timeout=600)
         except Exception:
             logger.error("Failed to stop profiling on workers", exc_info=True)
