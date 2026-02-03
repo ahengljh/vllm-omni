@@ -3,7 +3,7 @@
 > **Warning:** Profiling incurs significant overhead. Use only for development and debugging, never in production.
 
 vLLM-Omni supports two profiling approaches:
-- **PyTorch Profiler** — detailed CPU/CUDA traces (`.json.gz` files viewable in Perfetto)
+- **PyTorch Profiler** — detailed CPU/CUDA traces (`*.pt.trace.json` files viewable in Perfetto)
 - **Nsight Systems (nsys)** — GPU-level tracing with CUDA kernel timelines (`.nsys-rep` files)
 
 ### 1. Set the Output Directory (PyTorch Profiler)
@@ -19,6 +19,10 @@ It is best to limit profiling to one iteration to keep trace files manageable.
 
 ```bash
 export VLLM_PROFILER_MAX_ITERS=1
+```
+Optionally, skip initial warmup iterations before collecting traces:
+```bash
+export VLLM_PROFILER_DELAY_ITERS=1
 ```
 
 **Selective Stage Profiling**
@@ -142,12 +146,19 @@ For deeper GPU-level analysis of diffusion workloads, use NVIDIA Nsight Systems 
 ```bash
 # Enable CUDA profiler for nsys integration
 export VLLM_TORCH_CUDA_PROFILE=1
+# Capture a fixed range of iterations (skip warmup, then capture N iters)
+export VLLM_PROFILER_DELAY_ITERS=10
+export VLLM_PROFILER_MAX_ITERS=10
+# Optional: enable NVTX ranges (used by vLLM tracing)
+export VLLM_PROFILER_TRACE_DIR=./vllm_trace
 
 nsys profile \
   --capture-range=cudaProfilerApi \
-  --capture-range-end=repeat \
+  --capture-range-end=stop \
   --trace-fork-before-exec=true \
   --cuda-graph-trace=node \
+  --sample=none \
+  --stats=true \
   -o diffusion_trace \
   python image_to_video.py --model Wan-AI/Wan2.2-I2V-A14B-Diffusers ...
 ```
@@ -166,7 +177,7 @@ Open the `.nsys-rep` file in the Nsight Systems GUI for detailed CUDA kernel tim
 Output files are saved to your configured ```VLLM_TORCH_PROFILER_DIR```.
 
 **Output**
-**Chrome Trace** (```.json.gz```): Visual timeline of kernels and stages. Open in Perfetto UI.
+**Chrome Trace** (```.pt.trace.json```): Visual timeline of kernels and stages. Open in Perfetto UI.
 
 **Viewing Tools:**
 

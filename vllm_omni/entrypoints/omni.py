@@ -379,8 +379,10 @@ class OmniBase:
     def start_profile(self, stages: list[int] | None = None) -> None:
         """Start profiling for specified stages.
 
-        Sends start_profile command to stage workers. Profiling must be enabled
-        via VLLM_TORCH_PROFILER_DIR environment variable.
+        Sends start_profile command to stage workers. Profiling is configured
+        via vLLM profiler environment variables, e.g.:
+        - VLLM_TORCH_PROFILER_DIR for PyTorch profiler traces
+        - VLLM_TORCH_CUDA_PROFILE=1 for Nsight Systems (cuda profiler)
 
         Args:
             stages: List of stage IDs to start profiling. If None, starts
@@ -432,6 +434,9 @@ class OmniBase:
                     # This is the blocking call that triggers the RPC chain
                     stage_data = stage.stop_profile()
 
+                    if stage_data is None:
+                        continue
+
                     if isinstance(stage_data, dict):
                         # FIX: Handle both single key and list key formats
                         traces = stage_data.get("trace") or stage_data.get("traces")
@@ -457,8 +462,6 @@ class OmniBase:
                                 all_results["tables"].append(tables)
                             elif isinstance(tables, list):
                                 all_results["tables"].extend(tables)
-                        else:
-                            logger.warning(f"[{self._name}] Stage-{stage_id} returned no table data")
                     else:
                         logger.warning(f"[{self._name}] Stage-{stage_id} returned non-dict data: {type(stage_data)}")
                 else:

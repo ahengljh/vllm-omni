@@ -100,7 +100,6 @@ class DiffusionWorker:
                 profiler_config,
                 worker_name=worker_name,
                 local_rank=self.local_rank,
-                activities=["CPU", "CUDA"],
             )
         elif profiler_config.profiler == "cuda":
             self.profiler = CudaProfilerWrapper(profiler_config)
@@ -179,7 +178,15 @@ class DiffusionWorker:
                 if req.sampling_params.lora_request is not None:
                     raise
                 logger.warning("LoRA activation skipped: %s", exc)
-        return self.model_runner.execute_model(req)
+        profiler_context = (
+            self.profiler.annotate_context_manager("diffusion_forward") if self.profiler is not None else nullcontext()
+        )
+        with profiler_context:
+            output = self.model_runner.execute_model(req)
+        if self.profiler is not None:
+            # Drive delayed start/auto-stop behavior to match vLLM's profiler wrapper.
+            self.profiler.step()
+        return output
 
     def load_weights(self, weights) -> set[str]:
         """Load weights by delegating to the model runner."""

@@ -735,11 +735,11 @@ def _stage_worker(
         if task_type == OmniStageTaskType.PROFILER_START:
             if stage_type == "diffusion":
                 try:
-                    profile_dir = _os.environ.get("VLLM_TORCH_PROFILER_DIR", "./profiles")
-                    _os.makedirs(profile_dir, exist_ok=True)
-                    trace_filename = f"stage_{stage_id}_diffusion_{int(_time.time())}"
-                    stage_engine.start_profile(trace_filename=trace_filename)
-                    logger.info("[Stage-%s] Diffusion Torch profiler started", stage_id)
+                    profile_dir = _os.environ.get("VLLM_TORCH_PROFILER_DIR")
+                    if profile_dir:
+                        _os.makedirs(profile_dir, exist_ok=True)
+                    stage_engine.start_profile()
+                    logger.info("[Stage-%s] Diffusion profiler started", stage_id)
                 except Exception as e:
                     logger.warning("[Stage-%s] Failed to start diffusion profiler: %s", stage_id, e)
             else:
@@ -753,10 +753,9 @@ def _stage_worker(
         elif task_type == OmniStageTaskType.PROFILER_STOP:
             if stage_type == "diffusion":
                 try:
-                    # CRITICAL: Capture return value
                     result_data = stage_engine.stop_profile()
-                    logger.info("[Stage-%s] Diffusion Torch profiler stopped", stage_id)
-                    return result_data
+                    logger.info("[Stage-%s] Diffusion profiler stopped", stage_id)
+                    return result_data if isinstance(result_data, dict) else {}
                 except Exception as e:
                     logger.warning("[Stage-%s] Failed to stop diffusion profiler: %s", stage_id, e)
                     return {}
@@ -1289,11 +1288,11 @@ async def _stage_worker_async(
             if stage_type == "diffusion":
                 try:
                     # Sync call is safe here — diffusion profiling is lightweight
-                    profile_dir = os.environ.get("VLLM_TORCH_PROFILER_DIR", "./profiles")
-                    os.makedirs(profile_dir, exist_ok=True)
-                    trace_filename = f"stage_{stage_id}_diffusion_{int(time.time())}"
-                    stage_engine.start_profile(trace_filename=trace_filename)
-                    logger.info("[Stage-%s] Diffusion Torch profiler started", stage_id)
+                    profile_dir = os.environ.get("VLLM_TORCH_PROFILER_DIR")
+                    if profile_dir:
+                        os.makedirs(profile_dir, exist_ok=True)
+                    stage_engine.start_profile()
+                    logger.info("[Stage-%s] Diffusion profiler started", stage_id)
                 except Exception as e:
                     logger.warning("[Stage-%s] Failed to start diffusion profiler: %s", stage_id, e)
             else:
@@ -1306,10 +1305,10 @@ async def _stage_worker_async(
         elif task_type == OmniStageTaskType.PROFILER_STOP:
             if stage_type == "diffusion":
                 try:
-                    trace_files = stage_engine.stop_profile()
-                    logger.info("[Stage-%s] Diffusion Torch profiler stopped", stage_id)
-                    if trace_files:
-                        logger.info("Diffusion trace files: %s", trace_files)
+                    result_data = stage_engine.stop_profile()
+                    logger.info("[Stage-%s] Diffusion profiler stopped", stage_id)
+                    if result_data:
+                        logger.info("Diffusion profiler result: %s", result_data)
                 except Exception as e:
                     logger.warning("[Stage-%s] Failed to stop diffusion profiler: %s", stage_id, e)
             else:

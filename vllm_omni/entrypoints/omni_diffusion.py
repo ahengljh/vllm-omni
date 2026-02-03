@@ -120,7 +120,8 @@ class OmniDiffusion:
 
         Args:
             trace_filename: Optional base filename for trace files.
-                           If None, a timestamp-based name will be generated.
+                Note: vLLM profiler wrappers ignore this value and write traces
+                under VLLM_TORCH_PROFILER_DIR instead.
         """
         if hasattr(self, "engine") and self.engine:
             self.engine.start_profile(trace_filename)
