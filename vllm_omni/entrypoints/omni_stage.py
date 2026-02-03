@@ -732,19 +732,7 @@ def _stage_worker(
 
     def handle_profiler_task_local(task_type: OmniStageTaskType) -> dict:
         """Handle profiler task locally in the worker process."""
-        import torch
-
-        _has_cuda = torch.cuda.is_available()
-
         if task_type == OmniStageTaskType.PROFILER_START:
-            # Signal nsys to begin capturing (no-op on non-CUDA platforms)
-            if _has_cuda:
-                try:
-                    torch.cuda.profiler.start()
-                    logger.info("[Stage-%s] CUDA profiler started (nsys capture region open)", stage_id)
-                except Exception as e:
-                    logger.warning("[Stage-%s] Failed to start CUDA profiler: %s", stage_id, e)
-
             if stage_type == "diffusion":
                 try:
                     profile_dir = _os.environ.get("VLLM_TORCH_PROFILER_DIR", "./profiles")
@@ -763,14 +751,6 @@ def _stage_worker(
             return {}
 
         elif task_type == OmniStageTaskType.PROFILER_STOP:
-            # Signal nsys to stop capturing (no-op on non-CUDA platforms)
-            if _has_cuda:
-                try:
-                    torch.cuda.profiler.stop()
-                    logger.info("[Stage-%s] CUDA profiler stopped (nsys capture region closed)", stage_id)
-                except Exception as e:
-                    logger.warning("[Stage-%s] Failed to stop CUDA profiler: %s", stage_id, e)
-
             if stage_type == "diffusion":
                 try:
                     # CRITICAL: Capture return value
@@ -1305,19 +1285,7 @@ async def _stage_worker_async(
 
     async def handle_profiler_task_async(task_type: OmniStageTaskType) -> None:
         """Handle profiler task asynchronously for both LLM and diffusion stages."""
-        import torch
-
-        _has_cuda = torch.cuda.is_available()
-
         if task_type == OmniStageTaskType.PROFILER_START:
-            # Signal nsys to begin capturing (no-op on non-CUDA platforms)
-            if _has_cuda:
-                try:
-                    torch.cuda.profiler.start()
-                    logger.info("[Stage-%s] CUDA profiler started (nsys capture region open)", stage_id)
-                except Exception as e:
-                    logger.warning("[Stage-%s] Failed to start CUDA profiler: %s", stage_id, e)
-
             if stage_type == "diffusion":
                 try:
                     # Sync call is safe here — diffusion profiling is lightweight
@@ -1336,14 +1304,6 @@ async def _stage_worker_async(
                     logger.warning("[Stage-%s] Failed to start vLLM profiler: %s", stage_id, e)
 
         elif task_type == OmniStageTaskType.PROFILER_STOP:
-            # Signal nsys to stop capturing (no-op on non-CUDA platforms)
-            if _has_cuda:
-                try:
-                    torch.cuda.profiler.stop()
-                    logger.info("[Stage-%s] CUDA profiler stopped (nsys capture region closed)", stage_id)
-                except Exception as e:
-                    logger.warning("[Stage-%s] Failed to stop CUDA profiler: %s", stage_id, e)
-
             if stage_type == "diffusion":
                 try:
                     trace_files = stage_engine.stop_profile()
