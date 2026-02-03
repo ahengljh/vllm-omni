@@ -14,7 +14,6 @@ from typing import Any
 
 import torch
 import zmq
-
 from vllm.config import VllmConfig
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
