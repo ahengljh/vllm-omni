@@ -4,6 +4,7 @@
 from .connectors.base import OmniConnectorBase
 from .connectors.mooncake_connector import MooncakeConnector
 from .connectors.shm_connector import SharedMemoryConnector
+from .connectors.unified_connector import UnifiedConnector
 from .connectors.yuanrong_connector import YuanrongConnector
 from .factory import OmniConnectorFactory
 from .utils.config import ConnectorSpec, OmniTransferConfig
@@ -27,6 +28,7 @@ __all__ = [
     # Specific implementations
     "MooncakeConnector",
     "SharedMemoryConnector",
+    "UnifiedConnector",
     "YuanrongConnector",
     # Utilities
     "load_omni_transfer_config",

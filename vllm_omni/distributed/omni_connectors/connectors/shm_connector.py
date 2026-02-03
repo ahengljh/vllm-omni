@@ -49,19 +49,18 @@ class SharedMemoryConnector(OmniConnectorBase):
             payload = self.serialize_obj(data)
             size = len(payload)
 
-            metadata = {}
-            # if size > self.threshold:
-            if True:  # TODO: correct put & get logic
+            metadata: dict[str, Any] = {"size": size}
+            if size > self.threshold:
                 # Use Shared Memory
                 meta = shm_write_bytes(payload, name=put_key)
                 # meta contains {'name': ..., 'size': ...}
-                metadata[put_key] = {"shm": meta, "size": size}
+                metadata["shm"] = meta
                 self._metrics["shm_writes"] += 1
             else:
                 # Inline - pass bytes directly to avoid double serialization of the object
                 # We already serialized it to check size, so we pass the bytes.
                 # The Queue will pickle these bytes (fast), avoiding re-serializing the complex object.
-                metadata[put_key] = {"inline_bytes": payload, "size": size}
+                metadata["inline_bytes"] = payload
                 self._metrics["inline_writes"] += 1
 
             self._metrics["puts"] += 1
@@ -74,6 +73,34 @@ class SharedMemoryConnector(OmniConnectorBase):
             return False, 0, None
 
     def get(self, from_stage: str, to_stage: str, get_key: str, metadata=None) -> tuple[Any, int] | None:
+        if metadata is None:
+            return self._get_from_shm_name(get_key)
+
+        if not isinstance(metadata, dict) or not metadata:
+            return None
+
+        if "inline_bytes" in metadata:
+            try:
+                payload = metadata["inline_bytes"]
+                obj = self.deserialize_obj(payload)
+                return obj, len(payload)
+            except Exception as e:
+                logger.error(f"SharedMemoryConnector inline get failed for req {get_key}: {e}")
+                return None
+
+        if "shm" in metadata:
+            try:
+                shm_meta = metadata["shm"]
+                data_bytes = shm_read_bytes(shm_meta)
+                obj = self.deserialize_obj(data_bytes)
+                return obj, len(data_bytes)
+            except Exception as e:
+                logger.error(f"SharedMemoryConnector shm get failed for req {get_key}: {e}")
+                return None
+
+        return None
+
+    def _get_from_shm_name(self, get_key: str) -> tuple[Any, int] | None:
         from multiprocessing import shared_memory as shm_pkg
 
         # Wait for shared memory to be available (with retry logic)
@@ -102,8 +129,6 @@ class SharedMemoryConnector(OmniConnectorBase):
             return obj, shm.size
         finally:
             shm.close()
-
-        # TODO: update another read method
 
     def cleanup(self, request_id: str) -> None:
         # SHM segments are automatically unlinked during 'get' (shm_read_bytes).

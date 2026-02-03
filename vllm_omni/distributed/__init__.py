@@ -8,6 +8,7 @@ from .omni_connectors import (
     OmniConnectorFactory,
     OmniTransferConfig,
     SharedMemoryConnector,
+    UnifiedConnector,
     YuanrongConnector,
     load_omni_transfer_config,
 )
@@ -21,6 +22,7 @@ __all__ = [
     "OmniConnectorFactory",
     "MooncakeConnector",
     "SharedMemoryConnector",
+    "UnifiedConnector",
     "YuanrongConnector",
     # Utilities
     "load_omni_transfer_config",

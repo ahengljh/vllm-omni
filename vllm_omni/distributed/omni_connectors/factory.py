@@ -94,7 +94,21 @@ def _create_yuanrong_connector(config: dict[str, Any]) -> OmniConnectorBase:
     return YuanrongConnector(config)
 
 
+# Unified connector (tiered/backends)
+def _create_unified_connector(config: dict[str, Any]) -> OmniConnectorBase:
+    try:
+        from .connectors.unified_connector import UnifiedConnector
+    except ImportError:
+        import os
+        import sys
+
+        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+        from omni_connectors.connectors.unified_connector import UnifiedConnector
+    return UnifiedConnector(config)
+
+
 # Register connectors
 OmniConnectorFactory.register_connector("MooncakeConnector", _create_mooncake_connector)
 OmniConnectorFactory.register_connector("SharedMemoryConnector", _create_shm_connector)
 OmniConnectorFactory.register_connector("YuanrongConnector", _create_yuanrong_connector)
+OmniConnectorFactory.register_connector("UnifiedConnector", _create_unified_connector)
