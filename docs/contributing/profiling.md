@@ -135,11 +135,14 @@ python image_to_video.py \
 
 ### 4. Nsight Systems Profiling (Diffusion)
 
-For deeper GPU-level analysis of diffusion workloads, use NVIDIA Nsight Systems (`nsys`). The diffusion worker integrates with nsys via `torch.cuda.profiler.start()/stop()` when profiling is triggered.
+For deeper GPU-level analysis of diffusion workloads, use NVIDIA Nsight Systems (`nsys`). Diffusion workers follow the same profiler pattern as vLLM — set `VLLM_TORCH_CUDA_PROFILE=1` to enable the CUDA profiler which signals nsys via `torch.cuda.profiler.start()/stop()`.
 
 **Usage:**
 
 ```bash
+# Enable CUDA profiler for nsys integration
+export VLLM_TORCH_CUDA_PROFILE=1
+
 nsys profile \
   --capture-range=cudaProfilerApi \
   --capture-range-end=repeat \
@@ -149,7 +152,7 @@ nsys profile \
   python image_to_video.py --model Wan-AI/Wan2.2-I2V-A14B-Diffusers ...
 ```
 
-Set `VLLM_TORCH_PROFILER_DIR` to trigger profiling, which also opens nsys capture regions in diffusion worker processes.
+The `VLLM_TORCH_CUDA_PROFILE=1` environment variable configures diffusion workers to use vLLM's `CudaProfilerWrapper`, which brackets GPU work with `torch.cuda.profiler.start()/stop()` calls that nsys captures.
 
 ```bash
 ls diffusion_trace*.nsys-rep

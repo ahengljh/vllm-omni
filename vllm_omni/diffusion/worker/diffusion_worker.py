@@ -13,9 +13,12 @@ from contextlib import AbstractContextManager, nullcontext
 
 import torch
 import zmq
+from typing import Any
+
 from vllm.config import VllmConfig
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
+from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
 from vllm.utils.mem_utils import GiB_bytes
 
 from vllm_omni.diffusion.data import (
@@ -29,7 +32,6 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
-from vllm_omni.diffusion.profiler import CurrentProfiler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.lora.request import LoRARequest
@@ -65,6 +67,7 @@ class DiffusionWorker:
         self.model_runner: DiffusionModelRunner | None = None
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self.lora_manager: DiffusionLoRAManager | None = None
+        self.profiler: Any | None = None
         self.init_device()
 
     def init_device(self) -> None:
@@ -88,6 +91,21 @@ class DiffusionWorker:
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
         vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
         self.vllm_config = vllm_config
+
+        # Initialize profiler based on profiler_config (follows vLLM pattern)
+        profiler_config = vllm_config.profiler_config
+        if profiler_config.profiler == "torch":
+            worker_name = f"diffusion-rank-{self.rank}"
+            self.profiler = TorchProfilerWrapper(
+                profiler_config,
+                worker_name=worker_name,
+                local_rank=self.local_rank,
+                activities=["CPU", "CUDA"],
+            )
+        elif profiler_config.profiler == "cuda":
+            self.profiler = CudaProfilerWrapper(profiler_config)
+        else:
+            self.profiler = None
 
         # Initialize distributed environment
         with set_forward_context(vllm_config=vllm_config, omni_diffusion_config=self.od_config):
@@ -129,33 +147,27 @@ class DiffusionWorker:
         """Generate output for the given requests."""
         return self.execute_model(request, self.od_config)
 
-    @classmethod
-    def start_profile(cls, trace_path_template: str) -> str:
+    def start_profile(self, trace_path_template: str = "") -> str:
         """Start profiling for this GPU worker.
 
-        Also opens a CUDA profiler capture region so that nsys (when
-        launched with ``--capture-range=cudaProfilerApi``) records GPU
-        activity from within this worker process.
-        """
-        if torch.cuda.is_available():
-            try:
-                torch.cuda.profiler.start()
-            except Exception as e:
-                logger.warning("Failed to start CUDA profiler in DiffusionWorker: %s", e)
-        return CurrentProfiler.start(trace_path_template)
+        Uses vLLM's profiler wrappers based on profiler_config:
+        - 'torch': TorchProfilerWrapper for detailed CPU/CUDA traces
+        - 'cuda': CudaProfilerWrapper for nsys integration
 
-    @classmethod
-    def stop_profile(cls) -> dict | None:
-        """Stop profiling and return the result dictionary.
-
-        Also closes the CUDA profiler capture region for nsys.
+        Set VLLM_TORCH_CUDA_PROFILE=1 for nsys/cuda profiler, or
+        VLLM_TORCH_PROFILER_DIR for torch profiler.
         """
-        if torch.cuda.is_available():
-            try:
-                torch.cuda.profiler.stop()
-            except Exception as e:
-                logger.warning("Failed to stop CUDA profiler in DiffusionWorker: %s", e)
-        return CurrentProfiler.stop()
+        if self.profiler is not None:
+            self.profiler.start()
+            logger.info("Diffusion worker %s: profiler started", self.rank)
+        return trace_path_template
+
+    def stop_profile(self) -> dict | None:
+        """Stop profiling and return the result dictionary."""
+        if self.profiler is not None:
+            self.profiler.stop()
+            logger.info("Diffusion worker %s: profiler stopped", self.rank)
+        return None
 
     def execute_model(self, req: OmniDiffusionRequest, od_config: OmniDiffusionConfig) -> DiffusionOutput:
         """Execute a forward pass by delegating to the model runner."""
