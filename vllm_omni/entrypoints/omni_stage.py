@@ -47,6 +47,7 @@ from vllm_omni.entrypoints.stage_utils import (
     _to_dict,
     is_profiler_task,
     maybe_dump_to_shm,
+    maybe_load_from_ipc,
     set_stage_devices,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams, OmniTokensPrompt
@@ -254,6 +255,9 @@ class OmniStage:
         self.is_comprehension = getattr(stage_config, "is_comprehension", False)
         # Support for different stage types: "llm" (default) or "diffusion"
         self.stage_type: Literal["llm", "diffusion"] = getattr(stage_config, "stage_type", "llm")
+        # PD disaggregation flags
+        self.is_prefill_only: bool = getattr(stage_config, "is_prefill_only", False)
+        self.is_decode_only: bool = getattr(stage_config, "is_decode_only", False)
         if hasattr(stage_config, "custom_process_input_func"):
             # Import the module specified in the config (already a full module path)
             module_path, func_name = stage_config.custom_process_input_func.rsplit(".", 1)
@@ -565,12 +569,31 @@ class OmniStage:
         Returns:
             Result dictionary if available, None otherwise. Result contains
             request_id, engine_outputs (or engine_outputs_shm), and metrics.
+            For prefill-only stages, also includes kv_transfer_params extracted
+            from vLLM's RequestOutput if available.
         """
         assert self._out_q is not None
         try:
-            return self._out_q.get_nowait()
+            result = self._out_q.get_nowait()
         except Exception:
             return None
+
+        # Extract kv_transfer_params from prefill-only stage outputs.
+        # vLLM's RequestOutput carries kv_transfer_params when the engine is
+        # configured as a KV producer, which the orchestrator must forward to
+        # the decode stage.
+        if result is not None and self.is_prefill_only and "error" not in result:
+            engine_outputs = maybe_load_from_ipc(
+                result, obj_key="engine_outputs", shm_key="engine_outputs_shm"
+            )
+            if engine_outputs:
+                for output in engine_outputs:
+                    kv_params = getattr(output, "kv_transfer_params", None)
+                    if kv_params is not None:
+                        result["kv_transfer_params"] = kv_params
+                        break
+
+        return result
 
     def process_engine_inputs(
         self, stage_list: list[Any], prompt: OmniTokensPrompt | TextPrompt = None

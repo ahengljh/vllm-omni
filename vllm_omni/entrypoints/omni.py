@@ -3,6 +3,7 @@
 import json
 import multiprocessing as mp
 import os
+import threading
 import time
 import uuid
 import weakref
@@ -74,6 +75,30 @@ def omni_snapshot_download(model_id) -> str:
         return snapshot_download(model_id)
     else:
         return _dummy_snapshot_download(model_id)
+
+
+class KVMetadataStore:
+    """Thread-safe storage for per-request KV transfer metadata.
+
+    Used by the orchestrator to hold kv_transfer_params between the
+    prefill stage output and decode stage input during PD disaggregation.
+    """
+
+    def __init__(self):
+        self._store: dict[str, dict[str, Any]] = {}
+        self._lock = threading.Lock()
+
+    def set(self, request_id: str, metadata: dict[str, Any]) -> None:
+        with self._lock:
+            self._store[request_id] = metadata
+
+    def pop(self, request_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            return self._store.pop(request_id, None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._store.clear()
 
 
 class OmniBase:
@@ -519,6 +544,19 @@ class Omni(OmniBase):
     def __init__(self, model: str, **kwargs: Any) -> None:
         super().__init__(model, **kwargs)
 
+        # PD disaggregation: detect prefill-decode stage pair
+        self._pd_separation_pair: tuple[int, int] | None = self._detect_pd_separation()
+        self._kv_metadata_store = KVMetadataStore()
+        if self._pd_separation_pair is not None:
+            self._validate_pd_separation_config()
+            p_id, d_id = self._pd_separation_pair
+            logger.info(
+                "[%s] PD disaggregation detected: prefill=stage-%d, decode=stage-%d",
+                self._name,
+                p_id,
+                d_id,
+            )
+
         # Register weak reference cleanup (called on garbage collection)
         self._weak_finalizer = weakref.finalize(
             self,
@@ -527,6 +565,92 @@ class Omni(OmniBase):
             self._stage_in_queues,
             self._ray_pg,
         )
+
+    def _detect_pd_separation(self) -> tuple[int, int] | None:
+        """Detect prefill-decode stage pairs from stage configurations.
+
+        Scans stage list for a pair where one stage is marked
+        ``is_prefill_only=True`` and another is ``is_decode_only=True``
+        with the prefill stage listed in the decode stage's
+        ``engine_input_source``.
+
+        Returns:
+            ``(prefill_stage_id, decode_stage_id)`` if found, else ``None``.
+
+        Raises:
+            ValueError: If multiple PD pairs are detected (not supported).
+        """
+        pd_pairs: list[tuple[int, int]] = []
+        for i, stage in enumerate(self.stage_list):
+            if not getattr(stage, "is_prefill_only", False):
+                continue
+            for j, other in enumerate(self.stage_list):
+                if i == j:
+                    continue
+                if getattr(other, "is_decode_only", False) and i in getattr(
+                    other, "engine_input_source", []
+                ):
+                    pd_pairs.append((i, j))
+
+        if len(pd_pairs) > 1:
+            raise ValueError(
+                f"Multiple PD pairs detected ({pd_pairs}); "
+                "only a single PD pair per pipeline is supported"
+            )
+        return pd_pairs[0] if pd_pairs else None
+
+    def _validate_pd_separation_config(self) -> None:
+        """Validate that PD stage configurations are consistent.
+
+        Checks that the prefill stage engine args include a
+        ``kv_transfer_config`` with ``kv_role`` of ``kv_producer``, and the
+        decode stage has ``kv_role`` of ``kv_consumer``.  Also ensures
+        connector types and buffer settings match.
+
+        Raises:
+            ValueError: On any validation failure.
+        """
+        assert self._pd_separation_pair is not None
+        p_id, d_id = self._pd_separation_pair
+        p_stage = self.stage_list[p_id]
+        d_stage = self.stage_list[d_id]
+
+        def _get_kv_cfg(stage: OmniStage) -> dict[str, Any]:
+            ea = stage.engine_args
+            cfg = getattr(ea, "kv_transfer_config", None)
+            if cfg is None:
+                cfg = ea.get("kv_transfer_config", None) if hasattr(ea, "get") else None
+            if cfg is None:
+                raise ValueError(
+                    f"Stage-{stage.stage_id} is marked for PD disaggregation "
+                    "but has no 'kv_transfer_config' in engine_args"
+                )
+            return dict(cfg) if hasattr(cfg, "items") else cfg
+
+        p_cfg = _get_kv_cfg(p_stage)
+        d_cfg = _get_kv_cfg(d_stage)
+
+        p_role = p_cfg.get("kv_role")
+        d_role = d_cfg.get("kv_role")
+        if p_role not in ("kv_producer", "kv_both"):
+            raise ValueError(
+                f"Prefill stage-{p_id} kv_role must be 'kv_producer' or "
+                f"'kv_both', got '{p_role}'"
+            )
+        if d_role not in ("kv_consumer", "kv_both"):
+            raise ValueError(
+                f"Decode stage-{d_id} kv_role must be 'kv_consumer' or "
+                f"'kv_both', got '{d_role}'"
+            )
+
+        # Connector type must match
+        p_conn = p_cfg.get("kv_connector")
+        d_conn = d_cfg.get("kv_connector")
+        if p_conn != d_conn:
+            raise ValueError(
+                f"PD connector mismatch: prefill uses '{p_conn}', "
+                f"decode uses '{d_conn}'"
+            )
 
     @overload
     def generate(
@@ -824,19 +948,51 @@ class Omni(OmniBase):
                 next_stage_id = stage_id + 1
                 if next_stage_id <= final_stage_id_to_prompt[req_id]:
                     next_stage: OmniStage = self.stage_list[next_stage_id]
-                    try:
-                        # Derive inputs for the next stage, record preprocess time
-                        with metrics.stage_postprocess_timer(stage_id, req_id):
-                            next_inputs = next_stage.process_engine_inputs(
-                                self.stage_list, [request_id_to_prompt[req_id]]
+
+                    # PD disaggregation: when routing from prefill to decode,
+                    # re-submit the original prompt so the decode engine can
+                    # load the prefilled KV cache via vLLM's native connector.
+                    is_pd_routing = (
+                        self._pd_separation_pair is not None
+                        and self._pd_separation_pair == (stage_id, next_stage_id)
+                    )
+
+                    if is_pd_routing:
+                        # Use the original prompt as decode engine input
+                        original_prompt = request_id_to_prompt[req_id]
+                        next_inputs = [original_prompt] if not isinstance(original_prompt, list) else original_prompt
+
+                        # Inject kv_transfer_params into SamplingParams.extra_args
+                        kv_params = result.get("kv_transfer_params")
+                        if kv_params is not None:
+                            self._kv_metadata_store.set(str(req_id), kv_params)
+
+                        sp_next = sampling_params_list[next_stage_id]  # type: ignore[index]
+                        stored_kv_params = self._kv_metadata_store.pop(str(req_id))
+                        if stored_kv_params is not None:
+                            sp_next = sp_next.clone()
+                            if sp_next.extra_args is None:
+                                sp_next.extra_args = {}
+                            sp_next.extra_args["kv_transfer_params"] = stored_kv_params
+                            logger.debug(
+                                "[%s] PD routing: injected kv_transfer_params for req %s",
+                                self._name,
+                                req_id,
                             )
-                    except Exception as e:
-                        logger.exception(
-                            f"[{self._name}] Process engine inputs error for req {req_id}"
-                            f" at stage {next_stage_id}: {e}",
-                        )
-                        continue
-                    sp_next = sampling_params_list[next_stage_id]  # type: ignore[index]
+                    else:
+                        try:
+                            # Derive inputs for the next stage, record preprocess time
+                            with metrics.stage_postprocess_timer(stage_id, req_id):
+                                next_inputs = next_stage.process_engine_inputs(
+                                    self.stage_list, [request_id_to_prompt[req_id]]
+                                )
+                        except Exception as e:
+                            logger.exception(
+                                f"[{self._name}] Process engine inputs error for req {req_id}"
+                                f" at stage {next_stage_id}: {e}",
+                            )
+                            continue
+                        sp_next = sampling_params_list[next_stage_id]  # type: ignore[index]
 
                     # Check if we have a connector for this edge
                     connector_key = (str(stage_id), str(next_stage_id))
