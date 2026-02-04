@@ -165,6 +165,8 @@ class AsyncOmni(OmniBase):
                     "cache_config": cache_config,
                     "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
                     "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
+                    "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
+                    "layerwise_num_gpu_layers": kwargs.get("layerwise_num_gpu_layers", False),
                     "enforce_eager": kwargs.get("enforce_eager", False),
                 },
                 "final_output": True,
@@ -194,11 +196,10 @@ class AsyncOmni(OmniBase):
             if stage.vllm_config is not None and stage.tokenizer is not None:
                 try:
                     vllm_config = stage.vllm_config
-                    tokenizer = stage.tokenizer
                     # Initialize input_processor
+                    # OMNI: OmniInputProcessor creates tokenizer internally from vllm_config
                     self.input_processor = OmniInputProcessor(
                         vllm_config=vllm_config,
-                        tokenizer=tokenizer,
                     )
                     # Initialize model_config
                     self.model_config = vllm_config.model_config
@@ -672,6 +673,15 @@ class AsyncOmni(OmniBase):
             if stage.is_comprehension:
                 return stage.is_tracing_enabled
         return False
+
+    @property
+    def renderer(self):
+        """Return the renderer from input_processor if available.
+
+        OMNI: Required by upstream OpenAIServingModels.__init__ which
+        accesses engine_client.renderer.
+        """
+        return self.input_processor.renderer
 
     async def do_log_stats(self) -> None:
         pass
