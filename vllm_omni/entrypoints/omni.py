@@ -3,7 +3,6 @@
 import json
 import multiprocessing as mp
 import os
-import threading
 import time
 import uuid
 import weakref
@@ -75,30 +74,6 @@ def omni_snapshot_download(model_id) -> str:
         return snapshot_download(model_id)
     else:
         return _dummy_snapshot_download(model_id)
-
-
-class KVMetadataStore:
-    """Thread-safe storage for per-request KV transfer metadata.
-
-    Used by the orchestrator to hold kv_transfer_params between the
-    prefill stage output and decode stage input during PD disaggregation.
-    """
-
-    def __init__(self):
-        self._store: dict[str, dict[str, Any]] = {}
-        self._lock = threading.Lock()
-
-    def set(self, request_id: str, metadata: dict[str, Any]) -> None:
-        with self._lock:
-            self._store[request_id] = metadata
-
-    def pop(self, request_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            return self._store.pop(request_id, None)
-
-    def clear(self) -> None:
-        with self._lock:
-            self._store.clear()
 
 
 class OmniBase:
@@ -546,9 +521,10 @@ class Omni(OmniBase):
 
         # PD disaggregation: detect prefill-decode stage pair
         self._pd_separation_pair: tuple[int, int] | None = self._detect_pd_separation()
-        self._kv_metadata_store = KVMetadataStore()
+        self._pd_connector_info: dict[str, Any] | None = None
         if self._pd_separation_pair is not None:
             self._validate_pd_separation_config()
+            self._pd_connector_info = self._get_pd_connector_info()
             p_id, d_id = self._pd_separation_pair
             logger.info(
                 "[%s] PD disaggregation detected: prefill=stage-%d, decode=stage-%d",
@@ -652,6 +628,59 @@ class Omni(OmniBase):
                 f"decode uses '{d_conn}'"
             )
 
+    def _get_pd_connector_info(self) -> dict[str, Any] | None:
+        """Extract prefill engine KV connector info from stage config.
+
+        Reads ``engine_id`` and bootstrap address from the prefill stage's
+        ``kv_transfer_config`` so that the orchestrator can construct
+        per-request ``kv_transfer_params`` for both prefill and decode
+        stages.  This avoids the need for a runtime query to the engine.
+
+        Returns:
+            Dict with ``prefill_engine_id`` and ``prefill_bootstrap_addr``,
+            or ``None`` if the config does not contain the required info.
+        """
+        if self._pd_separation_pair is None:
+            return None
+
+        p_id, _ = self._pd_separation_pair
+        p_stage = self.stage_list[p_id]
+
+        ea = p_stage.engine_args
+        kv_cfg = getattr(ea, "kv_transfer_config", None)
+        if kv_cfg is None and hasattr(ea, "get"):
+            kv_cfg = ea.get("kv_transfer_config")
+        if kv_cfg is None:
+            return None
+
+        # Extract engine_id
+        if isinstance(kv_cfg, dict):
+            engine_id = kv_cfg.get("engine_id")
+            extra_cfg = kv_cfg.get("kv_connector_extra_config", {})
+        else:
+            engine_id = getattr(kv_cfg, "engine_id", None)
+            extra_cfg = getattr(kv_cfg, "kv_connector_extra_config", {})
+
+        # Extract bootstrap address (used by MooncakeConnector)
+        if isinstance(extra_cfg, dict):
+            bootstrap_port = extra_cfg.get("mooncake_bootstrap_port")
+        else:
+            bootstrap_port = getattr(extra_cfg, "mooncake_bootstrap_port", None)
+
+        # Default Mooncake bootstrap port
+        if bootstrap_port is None:
+            bootstrap_port = 25201
+
+        # In a single-machine setup both engines are local
+        bootstrap_addr = f"127.0.0.1:{bootstrap_port}"
+
+        info: dict[str, Any] = {
+            "prefill_engine_id": engine_id,
+            "prefill_bootstrap_addr": bootstrap_addr,
+        }
+        logger.debug("[%s] PD connector info: %s", self._name, info)
+        return info
+
     @overload
     def generate(
         self,
@@ -751,6 +780,26 @@ class Omni(OmniBase):
         if sampling_params_list is None:
             raise ValueError("sampling_params_list is required for pipelined generation")
 
+        # PD disaggregation: the user provides sampling params for the
+        # *logical* stages (thinker, talker, code2wav) but the PD config
+        # splits thinker into two physical stages (prefill + decode).
+        # Auto-duplicate the thinker params for the decode stage so the
+        # caller doesn't need to know about the internal split.
+        if (
+            self._pd_separation_pair is not None
+            and len(sampling_params_list) == len(self.stage_list) - 1
+        ):
+            p_id, d_id = self._pd_separation_pair
+            sp_list = list(sampling_params_list)
+            sp_list.insert(d_id, sp_list[p_id])
+            sampling_params_list = sp_list
+            logger.debug(
+                "[%s] PD mode: auto-duplicated thinker sampling params "
+                "for decode stage %d",
+                self._name,
+                d_id,
+            )
+
         if len(sampling_params_list) != len(self.stage_list):
             raise ValueError(f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}")
 
@@ -809,8 +858,29 @@ class Omni(OmniBase):
         # Mark first input time for stage-0
         metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
 
+        # Check if stage 0 is the prefill-only stage in a PD pair
+        _seed_is_prefill = (
+            self._pd_separation_pair is not None
+            and self._pd_separation_pair[0] == 0
+        )
+
         for req_id, prompt in request_id_to_prompt.items():
             sp0 = sampling_params_list[0]  # type: ignore[index]
+
+            if _seed_is_prefill:
+                # PD disaggregation: prefill-only stage generates a single
+                # token so vLLM's KV connector saves the KV cache.
+                # Aligned with vLLM's disaggregated serving proxy pattern.
+                sp0 = sp0.clone()
+                sp0.max_tokens = 1
+                if sp0.extra_args is None:
+                    sp0.extra_args = {}
+                sp0.extra_args["kv_transfer_params"] = {
+                    "do_remote_decode": True,
+                    "do_remote_prefill": False,
+                    "transfer_id": f"xfer-{req_id}",
+                }
+
             task = {
                 "request_id": req_id,
                 "engine_inputs": prompt,
@@ -962,23 +1032,46 @@ class Omni(OmniBase):
                         original_prompt = request_id_to_prompt[req_id]
                         next_inputs = [original_prompt] if not isinstance(original_prompt, list) else original_prompt
 
-                        # Inject kv_transfer_params into SamplingParams.extra_args
-                        kv_params = result.get("kv_transfer_params")
-                        if kv_params is not None:
-                            self._kv_metadata_store.set(str(req_id), kv_params)
-
                         sp_next = sampling_params_list[next_stage_id]  # type: ignore[index]
-                        stored_kv_params = self._kv_metadata_store.pop(str(req_id))
-                        if stored_kv_params is not None:
-                            sp_next = sp_next.clone()
-                            if sp_next.extra_args is None:
-                                sp_next.extra_args = {}
-                            sp_next.extra_args["kv_transfer_params"] = stored_kv_params
-                            logger.debug(
-                                "[%s] PD routing: injected kv_transfer_params for req %s",
-                                self._name,
-                                req_id,
-                            )
+                        sp_next = sp_next.clone()
+                        if sp_next.extra_args is None:
+                            sp_next.extra_args = {}
+
+                        # Build decode-side kv_transfer_params.  The decode
+                        # engine needs ``do_remote_prefill=True`` so the KV
+                        # connector loads the remotely prefilled KV cache.
+                        transfer_id = f"xfer-{req_id}"
+                        decode_kv_params: dict[str, Any] = {
+                            "do_remote_decode": False,
+                            "do_remote_prefill": True,
+                            "transfer_id": transfer_id,
+                        }
+
+                        # Add prefill engine connection info from config
+                        if self._pd_connector_info:
+                            eid = self._pd_connector_info.get("prefill_engine_id")
+                            if eid is not None:
+                                decode_kv_params["remote_engine_id"] = eid
+                            baddr = self._pd_connector_info.get("prefill_bootstrap_addr")
+                            if baddr is not None:
+                                decode_kv_params["remote_bootstrap_addr"] = baddr
+
+                        # If the prefill output carried connector metadata,
+                        # merge it in (some connectors return additional info).
+                        kv_params_from_output = result.get("kv_transfer_params")
+                        if kv_params_from_output:
+                            decode_kv_params.update(kv_params_from_output)
+                            # Ensure the decode role flags are correct
+                            decode_kv_params["do_remote_prefill"] = True
+                            decode_kv_params["do_remote_decode"] = False
+
+                        sp_next.extra_args["kv_transfer_params"] = decode_kv_params
+                        logger.debug(
+                            "[%s] PD routing: injected decode kv_transfer_params for req %s: %s",
+                            self._name,
+                            req_id,
+                            decode_kv_params,
+                        )
                     else:
                         try:
                             # Derive inputs for the next stage, record preprocess time

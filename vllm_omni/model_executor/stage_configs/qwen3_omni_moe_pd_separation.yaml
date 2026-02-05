@@ -10,10 +10,26 @@
 # Stage 3: Code2Wav         (RVQ codes -> audio waveform)
 #
 # Requirements:
-#   - A supported KV connector (MooncakeConnector, P2pNcclConnector, etc.)
+#   - A supported KV connector (MooncakeConnector, NixlConnector, etc.)
 #   - Prefill and decode stages must be able to communicate via the connector
+#   - Mooncake transfer engine must be installed if using MooncakeConnector
 #
-# Example tested on 3x H100-80G GPUs.
+# The orchestrator overrides max_tokens=1 for the prefill stage so it
+# performs only prompt processing + KV save, then the decode stage loads
+# the KV cache and generates the full response.
+#
+# engine_id values must be set explicitly so the orchestrator can tell the
+# decode engine where to pull KV from (the prefill engine's identity).
+#
+# IMPORTANT: MooncakeConnector does not support heterogeneous TP sizes.
+# Both prefill and decode stages MUST use the same tensor_parallel_size.
+# If the thinker model requires TP=2, set both stages to TP=2 and
+# allocate 2 GPUs for each (e.g. devices "0,1" and "2,3", 5 GPUs total).
+#
+# Example layout on 3x H100-80G GPUs (TP=1 for both):
+#   GPU 0: Thinker Prefill
+#   GPU 1: Thinker Decode
+#   GPU 2: Talker + Code2Wav
 
 async_chunk: false
 stage_args:
@@ -21,7 +37,7 @@ stage_args:
     stage_type: llm
     is_prefill_only: true
     runtime:
-      devices: "0,1"
+      devices: "0"
       max_batch_size: 16
     engine_args:
       model_stage: thinker
@@ -36,12 +52,15 @@ stage_args:
       enable_prefix_caching: false
       max_num_batched_tokens: 32768
       hf_config_name: thinker_config
-      tensor_parallel_size: 2
+      tensor_parallel_size: 1
       kv_transfer_config:
         kv_connector: "MooncakeConnector"
         kv_role: "kv_producer"
         kv_rank: 0
         kv_parallel_size: 2
+        engine_id: "omni-thinker-prefill"
+        kv_connector_extra_config:
+          mooncake_bootstrap_port: 25201
     final_output: true
     final_output_type: text
     is_comprehension: true
@@ -58,7 +77,7 @@ stage_args:
     stage_type: llm
     is_decode_only: true
     runtime:
-      devices: "2"
+      devices: "1"
       max_batch_size: 64
     engine_args:
       model_stage: thinker
@@ -79,6 +98,9 @@ stage_args:
         kv_role: "kv_consumer"
         kv_rank: 1
         kv_parallel_size: 2
+        engine_id: "omni-thinker-decode"
+        kv_connector_extra_config:
+          mooncake_bootstrap_port: 25202
     engine_input_source: [0]
     final_output: true
     final_output_type: text
