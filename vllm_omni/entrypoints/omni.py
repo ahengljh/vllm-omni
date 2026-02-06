@@ -120,6 +120,22 @@ class OmniBase:
         logger.info(f"Initializing stages for model: {model}")
         self._initialize_stages(model, kwargs)
 
+        # PD disaggregation: detect prefill-decode stage pair
+        self._pd_separation_pair: tuple[int, int] | None = self._detect_pd_separation()
+        self._pd_connector_info: dict[str, Any] | None = None
+        self._pd_kv_params_by_req: dict[str, dict[str, Any]] = {}
+        self._pd_kv_params_lock = threading.Lock()
+        if self._pd_separation_pair is not None:
+            self._validate_pd_separation_config()
+            self._pd_connector_info = self._get_pd_connector_info()
+            p_id, d_id = self._pd_separation_pair
+            logger.info(
+                "[%s] PD disaggregation detected: prefill=stage-%d, decode=stage-%d",
+                self._name,
+                p_id,
+                d_id,
+            )
+
     def _get_default_cache_config(self, cache_backend: str | None) -> dict[str, Any] | None:
         if cache_backend == "cache_dit":
             return {
@@ -491,69 +507,12 @@ class OmniBase:
     def is_async(self) -> bool:
         return False
 
-
-class Omni(OmniBase):
-    """Unified entrypoint for both LLM and Diffusion models for better usability.
-
-    Args:
-        model: Model name or path to load.
-        **kwargs: Arbitrary keyword arguments.
-            - stage_configs_path: Optional path to YAML file containing stage
-              configurations. If None, configurations are loaded from the model.
-            - log_stats: Whether to enable statistics logging
-              be written to files with stage-specific suffixes.
-            - stage_init_timeout: Per-stage init watchdog (seconds). Measured from
-              when the previous stage finished (possibly a prior Omni run with GPU
-              reuse/overlap) to when the current stage starts to initialize.
-            - shm_threshold_bytes: Threshold in bytes for using shared memory
-              for IPC. Objects larger than this threshold will use shared memory.
-            - worker_backend: Backend for worker processes. Default is "multi_process".
-            - ray_address: Address of Ray cluster for Ray backend, if using Ray backend.
-            - batch_timeout: Timeout in seconds for batching requests within a stage
-            - init_timeout: Timeout in seconds for waiting for all stages to initialize
-            - Additional keyword arguments passed to stage engines.
-
-    Example:
-        >>> omni = Omni(model="Qwen/Qwen2.5-Omni-7B")
-        >>> outputs = omni.generate(prompts="Hello, world!", sampling_params_list=[SamplingParams()])
-        >>> print(outputs)
-    """
-
-    def __init__(self, model: str, **kwargs: Any) -> None:
-        super().__init__(model, **kwargs)
-
-        # PD disaggregation: detect prefill-decode stage pair
-        self._pd_separation_pair: tuple[int, int] | None = self._detect_pd_separation()
-        self._pd_connector_info: dict[str, Any] | None = None
-        self._pd_kv_params_by_req: dict[str, dict[str, Any]] = {}
-        self._pd_kv_params_lock = threading.Lock()
-        if self._pd_separation_pair is not None:
-            self._validate_pd_separation_config()
-            self._pd_connector_info = self._get_pd_connector_info()
-            p_id, d_id = self._pd_separation_pair
-            logger.info(
-                "[%s] PD disaggregation detected: prefill=stage-%d, decode=stage-%d",
-                self._name,
-                p_id,
-                d_id,
-            )
-
-        # Register weak reference cleanup (called on garbage collection)
-        self._weak_finalizer = weakref.finalize(
-            self,
-            _weak_close_cleanup,
-            self.stage_list,
-            self._stage_in_queues,
-            self._ray_pg,
-        )
+    # ------------------------------------------------------------------
+    # PD (Prefill-Decode) disaggregation helpers
+    # ------------------------------------------------------------------
 
     def _detect_pd_separation(self) -> tuple[int, int] | None:
-        """Detect prefill-decode stage pairs from stage configurations.
-
-        Scans stage list for a pair where one stage is marked
-        ``is_prefill_only=True`` and another is ``is_decode_only=True``
-        with the prefill stage listed in the decode stage's
-        ``engine_input_source``.
+        """Scan stage_list for a prefill-only / decode-only pair.
 
         Returns:
             ``(prefill_stage_id, decode_stage_id)`` if found, else ``None``.
@@ -637,16 +596,7 @@ class Omni(OmniBase):
                 return None
 
     def _validate_pd_separation_config(self) -> None:
-        """Validate that PD stage configurations are consistent.
-
-        Checks that the prefill stage engine args include a
-        ``kv_transfer_config`` with ``kv_role`` of ``kv_producer``, and the
-        decode stage has ``kv_role`` of ``kv_consumer``.  Also ensures
-        connector types and buffer settings match.
-
-        Raises:
-            ValueError: On any validation failure.
-        """
+        """Validate that PD stage configurations are consistent."""
         assert self._pd_separation_pair is not None
         p_id, d_id = self._pd_separation_pair
         p_stage = self.stage_list[p_id]
@@ -685,14 +635,12 @@ class Omni(OmniBase):
                 f"'kv_both', got '{d_role}'"
             )
 
-        # Decode stage must take inputs from prefill stage
         d_sources = list(getattr(d_stage, "engine_input_source", []) or [])
         if p_id not in d_sources and p_stage.stage_id not in d_sources:
             raise ValueError(
                 f"Decode stage-{d_id} must list prefill stage-{p_id} in engine_input_source"
             )
 
-        # Connector type must match and be specified
         p_conn = p_cfg.get("kv_connector")
         d_conn = d_cfg.get("kv_connector")
         if p_conn != d_conn:
@@ -703,7 +651,6 @@ class Omni(OmniBase):
         if not p_conn:
             raise ValueError("PD disaggregation requires kv_connector to be set in kv_transfer_config")
 
-        # Buffer settings must match when specified
         for key in ("kv_buffer_device", "kv_buffer_size"):
             p_val = p_cfg.get(key)
             d_val = d_cfg.get(key)
@@ -713,17 +660,7 @@ class Omni(OmniBase):
                 )
 
     def _get_pd_connector_info(self) -> dict[str, Any] | None:
-        """Extract prefill engine KV connector info from stage config.
-
-        Reads ``engine_id`` and bootstrap address from the prefill stage's
-        ``kv_transfer_config`` so that the orchestrator can construct
-        per-request ``kv_transfer_params`` for both prefill and decode
-        stages.  This avoids the need for a runtime query to the engine.
-
-        Returns:
-            Dict with ``prefill_engine_id`` and ``prefill_bootstrap_addr``,
-            or ``None`` if the config does not contain the required info.
-        """
+        """Extract prefill engine KV connector info from stage config."""
         if self._pd_separation_pair is None:
             return None
 
@@ -749,7 +686,6 @@ class Omni(OmniBase):
 
         info: dict[str, Any] = {"prefill_engine_id": engine_id}
 
-        # Extract bootstrap address (used by MooncakeConnector)
         if "mooncake" in kv_connector.lower():
             bootstrap_port = extra_cfg.get("mooncake_bootstrap_port", None)
             if bootstrap_port is None:
@@ -795,6 +731,46 @@ class Omni(OmniBase):
     def _drop_pd_kv_params(self, req_id: str) -> None:
         with self._pd_kv_params_lock:
             self._pd_kv_params_by_req.pop(req_id, None)
+
+
+class Omni(OmniBase):
+    """Unified entrypoint for both LLM and Diffusion models for better usability.
+
+    Args:
+        model: Model name or path to load.
+        **kwargs: Arbitrary keyword arguments.
+            - stage_configs_path: Optional path to YAML file containing stage
+              configurations. If None, configurations are loaded from the model.
+            - log_stats: Whether to enable statistics logging
+              be written to files with stage-specific suffixes.
+            - stage_init_timeout: Per-stage init watchdog (seconds). Measured from
+              when the previous stage finished (possibly a prior Omni run with GPU
+              reuse/overlap) to when the current stage starts to initialize.
+            - shm_threshold_bytes: Threshold in bytes for using shared memory
+              for IPC. Objects larger than this threshold will use shared memory.
+            - worker_backend: Backend for worker processes. Default is "multi_process".
+            - ray_address: Address of Ray cluster for Ray backend, if using Ray backend.
+            - batch_timeout: Timeout in seconds for batching requests within a stage
+            - init_timeout: Timeout in seconds for waiting for all stages to initialize
+            - Additional keyword arguments passed to stage engines.
+
+    Example:
+        >>> omni = Omni(model="Qwen/Qwen2.5-Omni-7B")
+        >>> outputs = omni.generate(prompts="Hello, world!", sampling_params_list=[SamplingParams()])
+        >>> print(outputs)
+    """
+
+    def __init__(self, model: str, **kwargs: Any) -> None:
+        super().__init__(model, **kwargs)
+
+        # Register weak reference cleanup (called on garbage collection)
+        self._weak_finalizer = weakref.finalize(
+            self,
+            _weak_close_cleanup,
+            self.stage_list,
+            self._stage_in_queues,
+            self._ray_pg,
+        )
 
     @overload
     def generate(
