@@ -493,9 +493,7 @@ class AsyncOmni(OmniBase):
                         if baddr is not None:
                             decode_kv_params["remote_bootstrap_addr"] = baddr
 
-                    kv_from_prefill = self._normalize_kv_transfer_params(
-                        result.get("kv_transfer_params")
-                    )
+                    kv_from_prefill = self._extract_kv_transfer_params(engine_outputs)
                     if kv_from_prefill:
                         decode_kv_params.update(kv_from_prefill)
 

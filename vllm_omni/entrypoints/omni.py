@@ -732,6 +732,19 @@ class OmniBase:
         with self._pd_kv_params_lock:
             self._pd_kv_params_by_req.pop(req_id, None)
 
+    def _extract_kv_transfer_params(self, engine_outputs: Any) -> dict[str, Any] | None:
+        """Extract kv_transfer_params from already-loaded engine outputs.
+
+        Called after engine outputs have been deserialized from IPC so that
+        shared memory is only read once.
+        """
+        outputs = engine_outputs if isinstance(engine_outputs, list) else [engine_outputs]
+        for output in outputs:
+            kv_params = getattr(output, "kv_transfer_params", None)
+            if kv_params is not None:
+                return self._normalize_kv_transfer_params(kv_params)
+        return None
+
 
 class Omni(OmniBase):
     """Unified entrypoint for both LLM and Diffusion models for better usability.
@@ -1014,17 +1027,19 @@ class Omni(OmniBase):
                     time.sleep(0.05)
                     continue
 
+                engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
+
+                # PD: extract kv_transfer_params from prefill engine outputs
+                # (must happen after _load so shared memory is read only once).
                 if (
                     self._pd_separation_pair is not None
                     and req_id is not None
                     and stage_id == self._pd_separation_pair[0]
                 ):
-                    kv_params = self._normalize_kv_transfer_params(result.get("kv_transfer_params"))
+                    kv_params = self._extract_kv_transfer_params(engine_outputs)
                     if kv_params is not None:
                         with self._pd_kv_params_lock:
                             self._pd_kv_params_by_req[req_id] = kv_params
-
-                engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
                 # Mark last output time for this stage whenever we receive outputs
                 metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
                 try:

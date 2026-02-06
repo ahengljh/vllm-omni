@@ -574,30 +574,9 @@ class OmniStage:
         """
         assert self._out_q is not None
         try:
-            result = self._out_q.get_nowait()
+            return self._out_q.get_nowait()
         except Exception:
             return None
-
-        # Extract kv_transfer_params from prefill-only stage outputs.
-        # vLLM's RequestOutput carries kv_transfer_params when the engine is
-        # configured as a KV producer, which the orchestrator must forward to
-        # the decode stage.
-        if result is not None and self.is_prefill_only and "error" not in result:
-            if "engine_outputs" in result or "engine_outputs_shm" in result:
-                try:
-                    engine_outputs = maybe_load_from_ipc(
-                        result, obj_key="engine_outputs", shm_key="engine_outputs_shm"
-                    )
-                except Exception:
-                    engine_outputs = None
-                if engine_outputs:
-                    for output in engine_outputs:
-                        kv_params = getattr(output, "kv_transfer_params", None)
-                        if kv_params is not None:
-                            result["kv_transfer_params"] = kv_params
-                            break
-
-        return result
 
     def process_engine_inputs(
         self, stage_list: list[Any], prompt: OmniTokensPrompt | TextPrompt = None
