@@ -277,6 +277,23 @@ class AsyncOmni(OmniBase):
             if sampling_params_list is None:
                 sampling_params_list = self.default_sampling_params_list
 
+            # PD disaggregation: auto-duplicate thinker sampling params for
+            # the decode stage when the caller provides N-1 params.
+            if (
+                self._pd_separation_pair is not None
+                and len(sampling_params_list) == len(self.stage_list) - 1
+            ):
+                p_id, d_id = self._pd_separation_pair
+                sp_list = list(sampling_params_list)
+                sp_list.insert(d_id, sp_list[p_id])
+                sampling_params_list = sp_list
+                logger.debug(
+                    "[%s] PD mode: auto-duplicated thinker sampling params "
+                    "for decode stage %d",
+                    self._name,
+                    d_id,
+                )
+
             if len(sampling_params_list) != len(self.stage_list):
                 raise ValueError(f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}")
 
@@ -304,6 +321,15 @@ class AsyncOmni(OmniBase):
             req_state.metrics = metrics
             self.request_states[request_id] = req_state
             sp0: SamplingParams = sampling_params_list[0]  # type: ignore[index]
+
+            # PD disaggregation: prepare prefill-only sampling params for
+            # stage-0 (max_tokens=1, do_remote_decode=True).
+            if (
+                self._pd_separation_pair is not None
+                and self._pd_separation_pair[0] == 0
+            ):
+                sp0 = self._prepare_prefill_sampling_params(request_id, sp0)
+
             task = {
                 "request_id": request_id,
                 "engine_inputs": prompt,
@@ -439,10 +465,56 @@ class AsyncOmni(OmniBase):
             next_stage_id = stage_id + 1
             if next_stage_id <= final_stage_id_for_e2e:
                 next_stage: OmniStage = self.stage_list[next_stage_id]
-                # Derive inputs for the next stage, record postprocess time
-                with metrics.stage_postprocess_timer(stage_id, request_id):
-                    next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
-                sp_next: SamplingParams = sampling_params_list[next_stage_id]
+
+                # PD disaggregation: route from prefill → decode with
+                # original prompt and decode-side kv_transfer_params.
+                is_pd_routing = (
+                    self._pd_separation_pair is not None
+                    and self._pd_separation_pair == (stage_id, next_stage_id)
+                )
+
+                if is_pd_routing:
+                    next_inputs = [prompt] if not isinstance(prompt, list) else prompt
+                    sp_next = sampling_params_list[next_stage_id].clone()
+                    if sp_next.extra_args is None:
+                        sp_next.extra_args = {}
+
+                    decode_kv_params: dict[str, Any] = {
+                        "do_remote_decode": False,
+                        "do_remote_prefill": True,
+                        "transfer_id": f"xfer-{request_id}",
+                    }
+
+                    if self._pd_connector_info:
+                        eid = self._pd_connector_info.get("prefill_engine_id")
+                        if eid is not None:
+                            decode_kv_params["remote_engine_id"] = eid
+                        baddr = self._pd_connector_info.get("prefill_bootstrap_addr")
+                        if baddr is not None:
+                            decode_kv_params["remote_bootstrap_addr"] = baddr
+
+                    kv_from_prefill = self._normalize_kv_transfer_params(
+                        result.get("kv_transfer_params")
+                    )
+                    if kv_from_prefill:
+                        decode_kv_params.update(kv_from_prefill)
+
+                    decode_kv_params["do_remote_prefill"] = True
+                    decode_kv_params["do_remote_decode"] = False
+
+                    sp_next.extra_args["kv_transfer_params"] = decode_kv_params
+                    logger.debug(
+                        "[%s] PD routing: injected decode kv_transfer_params "
+                        "for req %s: %s",
+                        self._name,
+                        request_id,
+                        decode_kv_params,
+                    )
+                else:
+                    # Derive inputs for the next stage, record postprocess time
+                    with metrics.stage_postprocess_timer(stage_id, request_id):
+                        next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
+                    sp_next: SamplingParams = sampling_params_list[next_stage_id]
 
                 # Check if we have a connector for this edge
                 connector_key = (str(stage_id), str(next_stage_id))
