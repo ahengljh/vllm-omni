@@ -329,12 +329,25 @@ class AsyncOmni(OmniBase):
                 and self._pd_separation_pair[0] == 0
             ):
                 sp0 = self._prepare_prefill_sampling_params(request_id, sp0)
+                logger.info(
+                    "[%s] PD prefill SP prepared for req %s: max_tokens=%s, "
+                    "extra_args keys=%s, kv_transfer_params=%s",
+                    self._name,
+                    request_id,
+                    sp0.max_tokens,
+                    list(sp0.extra_args.keys()) if sp0.extra_args else None,
+                    sp0.extra_args.get("kv_transfer_params") if sp0.extra_args else None,
+                )
 
             task = {
                 "request_id": request_id,
                 "engine_inputs": prompt,
                 "sampling_params": sp0,
             }
+            # PD: store kv_transfer_params as top-level backup in task dict
+            # to survive any potential msgspec.Struct pickle serialization issues
+            if sp0.extra_args and "kv_transfer_params" in sp0.extra_args:
+                task["_kv_transfer_params"] = sp0.extra_args["kv_transfer_params"]
             self.stage_list[0].submit(task)
             metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
             _req_start_ts[request_id] = time.time()
@@ -501,10 +514,12 @@ class AsyncOmni(OmniBase):
                     decode_kv_params["do_remote_decode"] = False
 
                     sp_next.extra_args["kv_transfer_params"] = decode_kv_params
-                    logger.debug(
-                        "[%s] PD routing: injected decode kv_transfer_params "
-                        "for req %s: %s",
+                    logger.info(
+                        "[%s] PD routing: stage-%d→stage-%d, req %s, "
+                        "decode kv_transfer_params=%s",
                         self._name,
+                        stage_id,
+                        next_stage_id,
                         request_id,
                         decode_kv_params,
                     )

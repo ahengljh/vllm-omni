@@ -561,6 +561,16 @@ class OmniStage:
             else:
                 _inject_global_id(ein)
 
+        # PD safeguard: store kv_transfer_params as a plain-dict backup in the
+        # payload so it definitely survives pickle even if the msgspec.Struct
+        # extra_args field is silently dropped.
+        if "_kv_transfer_params" not in payload:
+            sp = payload.get("sampling_params")
+            if sp is not None and hasattr(sp, "extra_args") and sp.extra_args:
+                kv_tp = sp.extra_args.get("kv_transfer_params")
+                if kv_tp is not None:
+                    payload["_kv_transfer_params"] = dict(kv_tp)
+
         self._in_q.put(payload)
 
     def try_collect(self) -> dict[str, Any] | None:
@@ -839,6 +849,32 @@ def _stage_worker(
             in_q.put(task_to_readd)
         # Ensure that the popped tasks are with identical sampling params. Take one of them.
         batch_engine_sampling_params: OmniSamplingParams = batch_tasks[0]["sampling_params"]
+
+        # PD safeguard: if the task carries _kv_transfer_params (backup key
+        # stored by the orchestrator), ensure it's present in the SP's
+        # extra_args.  msgspec.Struct pickle with omit_defaults=True may
+        # silently drop the extra_args dict in some environments.
+        _kv_backup = batch_tasks[0].get("_kv_transfer_params")
+        if _kv_backup is not None:
+            sp = batch_engine_sampling_params
+            if not isinstance(sp, SamplingParams):
+                pass  # diffusion or other non-SP type, skip
+            else:
+                if sp.extra_args is None:
+                    sp.extra_args = {}
+                if "kv_transfer_params" not in sp.extra_args:
+                    sp.extra_args["kv_transfer_params"] = _kv_backup
+                    logger.info(
+                        "[Stage-%d] Injected kv_transfer_params from task backup: %s",
+                        stage_id,
+                        _kv_backup,
+                    )
+                else:
+                    logger.info(
+                        "[Stage-%d] kv_transfer_params already in SP extra_args: %s",
+                        stage_id,
+                        sp.extra_args["kv_transfer_params"],
+                    )
 
         batch_request_ids: list[Any] = []
         batch_engine_inputs: list[OmniPromptType] = []

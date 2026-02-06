@@ -718,6 +718,14 @@ class OmniBase:
             }
         )
         sp.extra_args["kv_transfer_params"] = merged
+        logger.info(
+            "[PD] _prepare_prefill_sampling_params: req=%s max_tokens=%s "
+            "kv_transfer_params=%s extra_args_id=%s",
+            req_id,
+            sp.max_tokens,
+            merged,
+            id(sp.extra_args),
+        )
         return sp
 
     def _pop_pd_kv_params(self, req_id: str, fallback: Any | None = None) -> dict[str, Any] | None:
