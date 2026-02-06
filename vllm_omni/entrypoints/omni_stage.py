@@ -583,15 +583,19 @@ class OmniStage:
         # configured as a KV producer, which the orchestrator must forward to
         # the decode stage.
         if result is not None and self.is_prefill_only and "error" not in result:
-            engine_outputs = maybe_load_from_ipc(
-                result, obj_key="engine_outputs", shm_key="engine_outputs_shm"
-            )
-            if engine_outputs:
-                for output in engine_outputs:
-                    kv_params = getattr(output, "kv_transfer_params", None)
-                    if kv_params is not None:
-                        result["kv_transfer_params"] = kv_params
-                        break
+            if "engine_outputs" in result or "engine_outputs_shm" in result:
+                try:
+                    engine_outputs = maybe_load_from_ipc(
+                        result, obj_key="engine_outputs", shm_key="engine_outputs_shm"
+                    )
+                except Exception:
+                    engine_outputs = None
+                if engine_outputs:
+                    for output in engine_outputs:
+                        kv_params = getattr(output, "kv_transfer_params", None)
+                        if kv_params is not None:
+                            result["kv_transfer_params"] = kv_params
+                            break
 
         return result
 
