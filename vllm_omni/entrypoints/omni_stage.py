@@ -963,10 +963,15 @@ def _stage_worker(
             logger.debug(f"Generate done: batch={len(batch_tasks)}, req_ids={batch_request_ids}, gen_ms={_gen_ms:.1f}")
 
             # PD diagnostic: log output details for stages with kv_transfer_params
+            # NOTE: MooncakeConnector only adds to _reqs_need_send when
+            # finish_reason is 'length' (FINISHED_LENGTH_CAPPED).  Any other
+            # finish_reason (e.g. 'stop') causes the transfer_id to be added
+            # to _reqs_not_processed, effectively CANCELLING the KV transfer.
             if _kv_backup is not None:
                 for ro in gen_outputs:
                     _ro_kv = getattr(ro, "kv_transfer_params", None)
                     _ro_ntoks = sum(len(o.token_ids) for o in ro.outputs) if hasattr(ro, "outputs") else "?"
+                    _ro_fr = getattr(ro.outputs[0], "finish_reason", None) if hasattr(ro, "outputs") and ro.outputs else None
                     logger.warning(
                         "[Stage-%d][PD] Engine output: engine_req_id=%s, "
                         "num_output_tokens=%s, finish_reason=%s, "
@@ -974,9 +979,18 @@ def _stage_worker(
                         stage_id,
                         ro.request_id,
                         _ro_ntoks,
-                        getattr(ro.outputs[0], "finish_reason", None) if hasattr(ro, "outputs") and ro.outputs else None,
+                        _ro_fr,
                         _ro_kv,
                     )
+                    if _ro_fr and str(_ro_fr) != "length":
+                        logger.warning(
+                            "[Stage-%d][PD] WARNING: finish_reason=%s is NOT "
+                            "'length' — MooncakeConnector will NOT send KV "
+                            "blocks. The decode engine will read uninitialized "
+                            "KV cache and produce garbled output!",
+                            stage_id,
+                            _ro_fr,
+                        )
 
             # Group outputs per request id with fallback
             req_to_outputs: dict[Any, list[Any]] = {rid: [] for rid in batch_request_ids}
