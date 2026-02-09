@@ -864,16 +864,22 @@ def _stage_worker(
                     sp.extra_args = {}
                 if "kv_transfer_params" not in sp.extra_args:
                     sp.extra_args["kv_transfer_params"] = _kv_backup
-                    logger.info(
-                        "[Stage-%d] Injected kv_transfer_params from task backup: %s",
+                    # Use WARNING level so it's visible in worker sub-processes
+                    logger.warning(
+                        "[Stage-%d][PD] Restored kv_transfer_params from backup "
+                        "(pickle dropped extra_args): %s",
                         stage_id,
                         _kv_backup,
                     )
                 else:
-                    logger.info(
-                        "[Stage-%d] kv_transfer_params already in SP extra_args: %s",
+                    logger.warning(
+                        "[Stage-%d][PD] kv_transfer_params present in SP extra_args "
+                        "(no backup needed): transfer_id=%s, do_remote_decode=%s, "
+                        "do_remote_prefill=%s",
                         stage_id,
-                        sp.extra_args["kv_transfer_params"],
+                        sp.extra_args["kv_transfer_params"].get("transfer_id"),
+                        sp.extra_args["kv_transfer_params"].get("do_remote_decode"),
+                        sp.extra_args["kv_transfer_params"].get("do_remote_prefill"),
                     )
 
         batch_request_ids: list[Any] = []
@@ -956,6 +962,22 @@ def _stage_worker(
             _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
             logger.debug(f"Generate done: batch={len(batch_tasks)}, req_ids={batch_request_ids}, gen_ms={_gen_ms:.1f}")
 
+            # PD diagnostic: log output details for stages with kv_transfer_params
+            if _kv_backup is not None:
+                for ro in gen_outputs:
+                    _ro_kv = getattr(ro, "kv_transfer_params", None)
+                    _ro_ntoks = sum(len(o.token_ids) for o in ro.outputs) if hasattr(ro, "outputs") else "?"
+                    logger.warning(
+                        "[Stage-%d][PD] Engine output: engine_req_id=%s, "
+                        "num_output_tokens=%s, finish_reason=%s, "
+                        "kv_transfer_params=%s",
+                        stage_id,
+                        ro.request_id,
+                        _ro_ntoks,
+                        getattr(ro.outputs[0], "finish_reason", None) if hasattr(ro, "outputs") and ro.outputs else None,
+                        _ro_kv,
+                    )
+
             # Group outputs per request id with fallback
             req_to_outputs: dict[Any, list[Any]] = {rid: [] for rid in batch_request_ids}
             unmapped: list[Any] = []
@@ -969,6 +991,13 @@ def _stage_worker(
                 idx = 0
                 for ro in unmapped:
                     target_rid = batch_request_ids[idx % len(batch_request_ids)]
+                    if _kv_backup is not None:
+                        logger.warning(
+                            "[Stage-%d][PD] Remapping engine_req_id=%s → "
+                            "orchestrator_req_id=%s (MooncakeConnector uses "
+                            "the engine_req_id internally)",
+                            stage_id, ro.request_id, target_rid,
+                        )
                     ro.request_id = target_rid
                     req_to_outputs[target_rid].append(ro)
                     idx += 1

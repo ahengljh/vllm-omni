@@ -487,6 +487,19 @@ class AsyncOmni(OmniBase):
                 )
 
                 if is_pd_routing:
+                    # Trace prefill engine outputs for PD debugging
+                    for _eo in engine_outputs:
+                        _eo_kv = getattr(_eo, "kv_transfer_params", None)
+                        _eo_ntoks = (
+                            sum(len(o.token_ids) for o in _eo.outputs)
+                            if hasattr(_eo, "outputs") and _eo.outputs else "?"
+                        )
+                        logger.info(
+                            "[%s][PD] Prefill stage-%d output for req %s: "
+                            "num_output_tokens=%s, kv_transfer_params=%s",
+                            self._name, stage_id, request_id,
+                            _eo_ntoks, _eo_kv,
+                        )
                     next_inputs = [prompt] if not isinstance(prompt, list) else prompt
                     sp_next = sampling_params_list[next_stage_id].clone()
                     if sp_next.extra_args is None:

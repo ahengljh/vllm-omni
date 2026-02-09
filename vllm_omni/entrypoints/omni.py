@@ -745,11 +745,22 @@ class OmniBase:
 
         Called after engine outputs have been deserialized from IPC so that
         shared memory is only read once.
+
+        Note: For MooncakeConnector, the vLLM scheduler's
+        ``request_finished()`` returns ``(delay_free_blocks, None)`` – it
+        never propagates kv_transfer_params back through the
+        ``EngineCoreOutput``.  So this method will normally return ``None``
+        for MooncakeConnector-based PD setups, and the orchestrator
+        constructs the decode-side params from its own knowledge instead.
         """
         outputs = engine_outputs if isinstance(engine_outputs, list) else [engine_outputs]
         for output in outputs:
             kv_params = getattr(output, "kv_transfer_params", None)
             if kv_params is not None:
+                logger.debug(
+                    "[PD] Extracted kv_transfer_params from engine output: %s",
+                    kv_params,
+                )
                 return self._normalize_kv_transfer_params(kv_params)
         return None
 
