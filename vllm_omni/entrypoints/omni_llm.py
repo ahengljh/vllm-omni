@@ -417,10 +417,10 @@ class OmniLLM(LLM):
                 reqs_to_recv = getattr(meta, "reqs_to_recv", None)
                 logger.warning(
                     "[OmniLLM][KV-DIAG] flush metadata: "
-                    "reqs_to_send=%s, reqs_to_recv=%s",
-                    {k: (tid, len(bids) if bids else 0)
-                     for k, (tid, bids) in reqs_to_send.items()}
-                    if reqs_to_send else "{}",
+                    "reqs_to_send=%d %s, reqs_to_recv=%d %s",
+                    len(reqs_to_send) if reqs_to_send else 0,
+                    list(reqs_to_send.keys()) if reqs_to_send else "{}",
+                    len(reqs_to_recv) if reqs_to_recv else 0,
                     list(reqs_to_recv.keys()) if reqs_to_recv else "{}",
                 )
 

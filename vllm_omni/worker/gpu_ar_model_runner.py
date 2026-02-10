@@ -152,14 +152,12 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     _np = getattr(_kv_meta, "reqs_not_processed", None)
                     logger.warning(
                         "[GPUARModelRunner][KV-DIAG] no_forward path: "
-                        "reqs_to_send=%s, reqs_to_recv=%s, "
+                        "reqs_to_send=%d %s, reqs_to_recv=%d %s, "
                         "reqs_not_processed=%s",
-                        {k: (tid, len(bids) if bids else 0)
-                         for k, (tid, bids) in _s2s.items()}
-                        if _s2s else "{}",
-                        {k: (tid, len(bids) if bids else 0)
-                         for k, (tid, bids) in _s2r.items()}
-                        if _s2r else "{}",
+                        len(_s2s) if _s2s else 0,
+                        list(_s2s.keys()) if _s2s else "{}",
+                        len(_s2r) if _s2r else 0,
+                        list(_s2r.keys()) if _s2r else "{}",
                         list(_np) if _np else "[]",
                     )
                 else:
