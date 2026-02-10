@@ -1205,12 +1205,25 @@ class Omni(OmniBase):
                             decode_kv_params["transfer_id"] = f"xfer-{req_id}"
 
                         sp_next.extra_args["kv_transfer_params"] = decode_kv_params
-                        logger.debug(
-                            "[%s] PD routing: injected decode kv_transfer_params for req %s: %s",
+                        logger.info(
+                            "[%s] PD routing: stage-%d→stage-%d, req %s, "
+                            "remote_request_id=%s, remote=%s:%s",
                             self._name,
+                            stage_id,
+                            next_stage_id,
                             req_id,
-                            decode_kv_params,
+                            decode_kv_params.get("remote_request_id", "NOT SET"),
+                            decode_kv_params.get("remote_host", "?"),
+                            decode_kv_params.get("remote_port", "?"),
                         )
+                        if "remote_request_id" not in decode_kv_params:
+                            logger.warning(
+                                "[%s] PD routing: remote_request_id NOT SET "
+                                "in decode_kv_params for req %s. Apply the "
+                                "mooncake_connector.py patch to fix this.",
+                                self._name,
+                                req_id,
+                            )
                     else:
                         try:
                             # Derive inputs for the next stage, record preprocess time

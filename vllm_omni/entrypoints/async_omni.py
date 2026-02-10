@@ -529,13 +529,28 @@ class AsyncOmni(OmniBase):
                     sp_next.extra_args["kv_transfer_params"] = decode_kv_params
                     logger.info(
                         "[%s] PD routing: stage-%d→stage-%d, req %s, "
+                        "remote_request_id=%s, remote=%s:%s, "
                         "decode kv_transfer_params=%s",
                         self._name,
                         stage_id,
                         next_stage_id,
                         request_id,
+                        decode_kv_params.get("remote_request_id", "NOT SET"),
+                        decode_kv_params.get("remote_host", "?"),
+                        decode_kv_params.get("remote_port", "?"),
                         decode_kv_params,
                     )
+                    if "remote_request_id" not in decode_kv_params:
+                        logger.warning(
+                            "[%s] PD routing: remote_request_id NOT SET "
+                            "in decode_kv_params for req %s. The decode "
+                            "engine's MooncakeConnector will use its own "
+                            "request_id which differs from the prefill "
+                            "engine's — KV transfer will FAIL. Apply the "
+                            "mooncake_connector.py patch to fix this.",
+                            self._name,
+                            request_id,
+                        )
                 else:
                     # Derive inputs for the next stage, record postprocess time
                     with metrics.stage_postprocess_timer(stage_id, request_id):

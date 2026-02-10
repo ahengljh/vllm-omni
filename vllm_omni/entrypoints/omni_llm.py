@@ -230,7 +230,14 @@ class OmniLLM(LLM):
 
         send_info = {}
         for req_id, val in sends.items():
-            if isinstance(val, tuple) and len(val) == 2:
+            if isinstance(val, list):
+                # Patched format: dict[ReqId, list[int]]
+                send_info[req_id] = {
+                    "n_blocks": len(val),
+                    "has_blocks": bool(val),
+                }
+            elif isinstance(val, tuple) and len(val) == 2:
+                # Upstream format: dict[ReqId, (Request, list[int])]
                 req_obj, block_ids = val
                 params = getattr(req_obj, "kv_transfer_params", None) or {}
                 send_info[req_id] = {
@@ -394,7 +401,17 @@ class OmniLLM(LLM):
 
             # Log details of what we're about to flush
             for req_id, val in pending.items():
-                if isinstance(val, tuple) and len(val) == 2:
+                if isinstance(val, list):
+                    # Patched format: dict[ReqId, list[int]]
+                    logger.warning(
+                        "[OmniLLM][KV-DIAG] flush: will send req=%s, "
+                        "block_ids=%s (n=%d)",
+                        req_id,
+                        val[:8] if val else "[]",
+                        len(val),
+                    )
+                elif isinstance(val, tuple) and len(val) == 2:
+                    # Upstream format: dict[ReqId, (Request, list[int])]
                     _, block_ids = val
                     logger.warning(
                         "[OmniLLM][KV-DIAG] flush: will send req=%s, "

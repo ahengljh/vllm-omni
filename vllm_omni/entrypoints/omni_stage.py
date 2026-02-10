@@ -872,14 +872,18 @@ def _stage_worker(
                         _kv_backup,
                     )
                 else:
+                    _kv_p = sp.extra_args["kv_transfer_params"]
                     logger.warning(
                         "[Stage-%d][PD] kv_transfer_params present in SP extra_args "
-                        "(no backup needed): transfer_id=%s, do_remote_decode=%s, "
-                        "do_remote_prefill=%s",
+                        "(no backup needed): do_remote_decode=%s, "
+                        "do_remote_prefill=%s, remote_request_id=%s, "
+                        "remote_host=%s, remote_port=%s",
                         stage_id,
-                        sp.extra_args["kv_transfer_params"].get("transfer_id"),
-                        sp.extra_args["kv_transfer_params"].get("do_remote_decode"),
-                        sp.extra_args["kv_transfer_params"].get("do_remote_prefill"),
+                        _kv_p.get("do_remote_decode"),
+                        _kv_p.get("do_remote_prefill"),
+                        _kv_p.get("remote_request_id", "NOT SET"),
+                        _kv_p.get("remote_host", "?"),
+                        _kv_p.get("remote_port", "?"),
                     )
 
         batch_request_ids: list[Any] = []
@@ -965,7 +969,7 @@ def _stage_worker(
             # PD diagnostic: log output details for stages with kv_transfer_params
             # NOTE: MooncakeConnector only adds to _reqs_need_send when
             # finish_reason is 'length' (FINISHED_LENGTH_CAPPED).  Any other
-            # finish_reason (e.g. 'stop') causes the transfer_id to be added
+            # finish_reason (e.g. 'stop') causes the request to be added
             # to _reqs_not_processed, effectively CANCELLING the KV transfer.
             if _kv_backup is not None:
                 for ro in gen_outputs:
