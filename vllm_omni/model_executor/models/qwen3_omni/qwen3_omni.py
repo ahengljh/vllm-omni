@@ -788,10 +788,17 @@ class Qwen3OmniMoeForConditionalGeneration(
         Returns:
             (input_ids, input_embeds) for talker
         """
+        # Use the minimum length across thinker_result_ids, thinker_embed and
+        # thinker_hidden so that segment boundaries never exceed any tensor.
+        seq_len = min(
+            thinker_result_ids.shape[-1],
+            thinker_embed.shape[0],
+            thinker_hidden.shape[0],
+        )
         im_start_indexes = torch.cat(
             (
                 torch.nonzero(input_ids[0] == self.config.im_start_token_id).squeeze(),
-                torch.tensor([thinker_result_ids.shape[-1]], device=input_ids.device, dtype=input_ids.dtype),
+                torch.tensor([seq_len], device=input_ids.device, dtype=input_ids.dtype),
             ),
             dim=-1,
         )  # Shape [n_starts + 1]; Take batch 0 since batched inference is not supported here.
@@ -911,8 +918,25 @@ class Qwen3OmniMoeForConditionalGeneration(
         return last_talker_hidden, text_step, update_dict
 
     def _get_talker_user_parts(self, im_start_index, segment_end_index, multimodal_mask, thinker_hidden, thinker_embed):
+        # Clamp segment_end_index to the shortest tensor so mask and embed
+        # slices always have the same length (guards against length mismatches
+        # between thinker_result_ids, thinker_embed, and thinker_hidden).
+        segment_end_index = min(
+            segment_end_index,
+            multimodal_mask.shape[0],
+            thinker_hidden.shape[0],
+            thinker_embed.shape[0],
+        )
+        seg_len = segment_end_index - im_start_index
+        if seg_len <= 0:
+            return torch.empty(
+                (0, self.config.talker_config.text_config.hidden_size),
+                device=thinker_hidden.device,
+                dtype=torch.bfloat16,
+            )
+
         user_talker_part = torch.empty(
-            (segment_end_index - im_start_index, self.config.talker_config.text_config.hidden_size),
+            (seg_len, self.config.talker_config.text_config.hidden_size),
             device=thinker_hidden.device,
             dtype=torch.bfloat16,
         )
