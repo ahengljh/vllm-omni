@@ -36,6 +36,29 @@ class OmniGenerationScheduler(VLLMScheduler):
             self.omni_connector = OmniConnectorFactory.create_connector(connector_specs)
         self.stage_id = getattr(self.vllm_config.model_config, "stage_id", None)
 
+    def _get_routed_experts(self, request: Request):
+        """Return routed-experts array for *request*, or ``None``.
+
+        Delegates to the parent ``Scheduler`` when it provides this method
+        (vLLM >= 0.9); otherwise returns ``None`` so that older vLLM
+        installations don't crash.
+        """
+        parent = getattr(super(), "_get_routed_experts", None)
+        if parent is not None:
+            return parent(request)
+        return None
+
+    def _handle_stopped_request(self, request: Request) -> bool:
+        """Handle a stopped request — returns ``True`` when truly finished.
+
+        Delegates to the parent ``Scheduler`` when it provides this method
+        (vLLM >= 0.9); otherwise falls back to checking the request status.
+        """
+        parent = getattr(super(), "_handle_stopped_request", None)
+        if parent is not None:
+            return parent(request)
+        return request.status.is_finished
+
     def schedule(self) -> SchedulerOutput:
         """Diffusion fast path:
         - Feed all input tokens of the request at once

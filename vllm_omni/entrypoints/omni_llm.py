@@ -196,6 +196,71 @@ class OmniLLM(LLM):
         except Exception as e:
             logger.debug("[Orchestrator] __del__ close() raised: %s", e, exc_info=True)
 
+    # ------------------------------------------------------------------
+    # KV connector diagnostics (PD disaggregation)
+    # ------------------------------------------------------------------
+
+    def _get_kv_connector_scheduler(self):
+        """Return the MooncakeConnectorScheduler instance if present."""
+        try:
+            engine_core = getattr(self.llm_engine, "engine_core", None)
+            if engine_core is None:
+                return None
+            scheduler = getattr(engine_core, "scheduler", None)
+            if scheduler is None:
+                return None
+            connector = getattr(scheduler, "connector", None)
+            if connector is None:
+                return None
+            return getattr(connector, "connector_scheduler", None)
+        except Exception:
+            return None
+
+    def _log_kv_connector_state(self, label: str) -> None:
+        """Log complete KV connector scheduler state for PD debugging."""
+        cs = self._get_kv_connector_scheduler()
+        if cs is None:
+            return
+
+        sends = getattr(cs, "_reqs_need_send", {})
+        recvs = getattr(cs, "_reqs_need_recv", {})
+        not_proc = getattr(cs, "_reqs_not_processed", set())
+        is_producer = getattr(cs, "is_kv_producer", None)
+        is_consumer = getattr(cs, "is_kv_consumer", None)
+
+        send_info = {}
+        for req_id, val in sends.items():
+            if isinstance(val, list):
+                # Patched format: dict[ReqId, list[int]]
+                send_info[req_id] = {
+                    "n_blocks": len(val),
+                    "has_blocks": bool(val),
+                }
+            elif isinstance(val, tuple) and len(val) == 2:
+                # Upstream format: dict[ReqId, (Request, list[int])]
+                req_obj, block_ids = val
+                params = getattr(req_obj, "kv_transfer_params", None) or {}
+                send_info[req_id] = {
+                    "n_blocks": len(block_ids) if block_ids else 0,
+                    "has_blocks": bool(block_ids),
+                    "transfer_id": params.get("transfer_id"),
+                }
+            else:
+                send_info[req_id] = repr(type(val))
+
+        logger.warning(
+            "[OmniLLM][KV-DIAG] %s: role=%s, "
+            "sends=%d %s, recvs=%d, not_processed=%s",
+            label,
+            "producer" if is_producer else ("consumer" if is_consumer else "?"),
+            len(sends),
+            send_info if send_info else "{}",
+            len(recvs),
+            list(not_proc) if not_proc else "[]",
+        )
+
+    # ------------------------------------------------------------------
+
     def _run_engine(self, *, use_tqdm: bool | Callable[..., tqdm] = True) -> list[RequestOutput | PoolingRequestOutput]:
         # Initialize tqdm.
         if use_tqdm:
@@ -208,15 +273,43 @@ class OmniLLM(LLM):
                 postfix=(f"est. speed input: {0:.2f} toks/s, output: {0:.2f} toks/s"),
             )
 
+        # PD diagnostic: check if engine has KV connector
+        _kv_cs = self._get_kv_connector_scheduler()
+        _has_kv = _kv_cs is not None
+        if _has_kv:
+            self._log_kv_connector_state("engine_loop_start")
+
         # Run the engine.
         outputs: list[RequestOutput | PoolingRequestOutput] = []
         total_in_toks = 0
         total_out_toks = 0
+        _step = 0
         while self.llm_engine.has_unfinished_requests():
             step_outputs = self.llm_engine.step()
+            _step += 1
+            _finished_this_step = False
+
             for output in step_outputs:
                 if output.finished:
                     outputs.append(output)
+                    _finished_this_step = True
+
+                    # PD diagnostic: log finished request details
+                    if _has_kv:
+                        _fr = (
+                            output.outputs[0].finish_reason
+                            if hasattr(output, "outputs") and output.outputs
+                            else None
+                        )
+                        logger.warning(
+                            "[OmniLLM][KV-DIAG] step %d: finished req=%s, "
+                            "finish_reason=%s, kv_transfer_params=%s",
+                            _step,
+                            output.request_id,
+                            _fr,
+                            getattr(output, "kv_transfer_params", None),
+                        )
+
                     if use_tqdm:
                         if isinstance(output, RequestOutput):
                             # Calculate tokens only for RequestOutput
@@ -233,9 +326,133 @@ class OmniLLM(LLM):
                         if pbar.n == num_requests:
                             pbar.refresh()
 
+            if _has_kv and _finished_this_step:
+                self._log_kv_connector_state(f"after_step_{_step}")
+
         if use_tqdm:
             pbar.close()
         # Sort the outputs by the int part of request ID which is in format of 'int-uuid'.
         # This is necessary because some requests may be finished earlier than
         # its previous requests.
+
+        # PD disaggregation: flush any pending KV connector sends that were
+        # added by request_finished() after the last build_connector_meta()
+        # call.  Without this flush, the prefill engine's worker never
+        # receives the block IDs needed for KV transfer to the decode engine.
+        if _has_kv:
+            self._log_kv_connector_state("before_flush")
+        self._flush_kv_connector_sends()
+        if _has_kv:
+            self._log_kv_connector_state("after_flush")
+
         return sorted(outputs, key=lambda x: int(x.request_id.split("-")[0]))
+
+    def _flush_kv_connector_sends(self) -> None:
+        """Flush pending KV connector send metadata to workers.
+
+        When _run_engine() finishes a batch, request_finished() may have
+        added entries to _reqs_need_send *after* the last
+        build_connector_meta() call within that step's schedule().  In
+        standard vLLM online serving this is not a problem because the
+        engine loop continues and the next schedule() picks them up.  In
+        OmniLLM batch mode the loop exits immediately, so we must run one
+        more empty-request step to deliver the metadata.
+        """
+        try:
+            engine_core = getattr(self.llm_engine, "engine_core", None)
+            if engine_core is None:
+                return
+            scheduler = getattr(engine_core, "scheduler", None)
+            if scheduler is None:
+                return
+            connector = getattr(scheduler, "connector", None)
+            if connector is None:
+                return
+
+            # Check whether the scheduler-side connector has unflushed sends.
+            cs = getattr(connector, "connector_scheduler", None)
+            if cs is None:
+                logger.warning(
+                    "[OmniLLM][KV-DIAG] flush: connector exists but "
+                    "connector_scheduler is None"
+                )
+                return
+
+            pending = getattr(cs, "_reqs_need_send", None)
+            not_proc = getattr(cs, "_reqs_not_processed", set())
+
+            logger.warning(
+                "[OmniLLM][KV-DIAG] flush: pending_sends=%d, "
+                "not_processed=%d (%s), is_producer=%s",
+                len(pending) if pending else 0,
+                len(not_proc),
+                list(not_proc) if not_proc else "[]",
+                getattr(cs, "is_kv_producer", None),
+            )
+
+            if not pending:
+                logger.warning(
+                    "[OmniLLM][KV-DIAG] flush: _reqs_need_send is empty — "
+                    "request_finished() likely did NOT re-add the entry "
+                    "(build_connector_meta already consumed it with empty "
+                    "block_ids during the same step's schedule())"
+                )
+                return
+
+            # Log details of what we're about to flush
+            for req_id, val in pending.items():
+                if isinstance(val, list):
+                    # Patched format: dict[ReqId, list[int]]
+                    logger.warning(
+                        "[OmniLLM][KV-DIAG] flush: will send req=%s, "
+                        "block_ids=%s (n=%d)",
+                        req_id,
+                        val[:8] if val else "[]",
+                        len(val),
+                    )
+                elif isinstance(val, tuple) and len(val) == 2:
+                    # Upstream format: dict[ReqId, (Request, list[int])]
+                    _, block_ids = val
+                    logger.warning(
+                        "[OmniLLM][KV-DIAG] flush: will send req=%s, "
+                        "block_ids=%s (n=%d)",
+                        req_id,
+                        block_ids[:8] if block_ids else "[]",
+                        len(block_ids) if block_ids else 0,
+                    )
+
+            from vllm.v1.core.sched.output import SchedulerOutput
+
+            # Create an empty scheduler output and attach connector metadata.
+            so = SchedulerOutput.make_empty()
+            meta = connector.build_connector_meta(so)
+            so.kv_connector_metadata = meta
+
+            # Log what the metadata contains
+            if meta is not None:
+                reqs_to_send = getattr(meta, "reqs_to_send", None)
+                reqs_to_recv = getattr(meta, "reqs_to_recv", None)
+                logger.warning(
+                    "[OmniLLM][KV-DIAG] flush metadata: "
+                    "reqs_to_send=%d %s, reqs_to_recv=%d %s",
+                    len(reqs_to_send) if reqs_to_send else 0,
+                    list(reqs_to_send.keys()) if reqs_to_send else "{}",
+                    len(reqs_to_recv) if reqs_to_recv else 0,
+                    list(reqs_to_recv.keys()) if reqs_to_recv else "{}",
+                )
+
+            # Run an empty model step: the worker sees
+            # total_num_scheduled_tokens == 0 and takes the no_forward()
+            # path, which only processes connector metadata
+            # (record_send_reqs → sets ready event on SendBlockMeta).
+            model_executor = getattr(engine_core, "model_executor", None)
+            if model_executor is None:
+                return
+            model_executor.execute_model(so)
+
+            logger.warning("[OmniLLM] KV connector sends flushed successfully")
+        except Exception:
+            logger.warning(
+                "[OmniLLM] Failed to flush KV connector sends",
+                exc_info=True,
+            )

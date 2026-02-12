@@ -143,7 +143,38 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if no work to do.
                     return EMPTY_MODEL_RUNNER_OUTPUT
-                return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+
+                # PD diagnostic: log no_forward path entry
+                _kv_meta = getattr(scheduler_output, "kv_connector_metadata", None)
+                if _kv_meta is not None:
+                    _s2s = getattr(_kv_meta, "reqs_to_send", None)
+                    _s2r = getattr(_kv_meta, "reqs_to_recv", None)
+                    _np = getattr(_kv_meta, "reqs_not_processed", None)
+                    logger.warning(
+                        "[GPUARModelRunner][KV-DIAG] no_forward path: "
+                        "reqs_to_send=%d %s, reqs_to_recv=%d %s, "
+                        "reqs_not_processed=%s",
+                        len(_s2s) if _s2s else 0,
+                        list(_s2s.keys()) if _s2s else "{}",
+                        len(_s2r) if _s2r else 0,
+                        list(_s2r.keys()) if _s2r else "{}",
+                        list(_np) if _np else "[]",
+                    )
+                else:
+                    logger.warning(
+                        "[GPUARModelRunner][KV-DIAG] no_forward path: "
+                        "kv_connector_metadata is None"
+                    )
+
+                result = self.kv_connector_no_forward(
+                    scheduler_output, self.vllm_config
+                )
+                logger.warning(
+                    "[GPUARModelRunner][KV-DIAG] no_forward completed, "
+                    "result_type=%s",
+                    type(result).__name__ if result is not None else "None",
+                )
+                return result
 
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
@@ -294,6 +325,18 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 logits_index=logits_indices,
                 sampler=self.sampler,
             )
+
+        # PD diagnostic: log kv_connector_output after forward pass
+        if kv_connector_output is not None and has_kv_transfer_group():
+            _co_send = getattr(kv_connector_output, "reqs_to_send", None)
+            _co_recv = getattr(kv_connector_output, "reqs_to_recv", None)
+            if _co_send or _co_recv:
+                logger.warning(
+                    "[GPUARModelRunner][KV-DIAG] forward kv_connector_output: "
+                    "sends=%d, recvs=%d",
+                    len(_co_send) if _co_send else 0,
+                    len(_co_recv) if _co_recv else 0,
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

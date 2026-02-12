@@ -47,6 +47,7 @@ from vllm_omni.entrypoints.stage_utils import (
     _to_dict,
     is_profiler_task,
     maybe_dump_to_shm,
+    maybe_load_from_ipc,
     set_stage_devices,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams, OmniTokensPrompt
@@ -254,6 +255,9 @@ class OmniStage:
         self.is_comprehension = getattr(stage_config, "is_comprehension", False)
         # Support for different stage types: "llm" (default) or "diffusion"
         self.stage_type: Literal["llm", "diffusion"] = getattr(stage_config, "stage_type", "llm")
+        # PD disaggregation flags
+        self.is_prefill_only: bool = getattr(stage_config, "is_prefill_only", False)
+        self.is_decode_only: bool = getattr(stage_config, "is_decode_only", False)
         if hasattr(stage_config, "custom_process_input_func"):
             # Import the module specified in the config (already a full module path)
             module_path, func_name = stage_config.custom_process_input_func.rsplit(".", 1)
@@ -432,6 +436,8 @@ class OmniStage:
             "connectors_config": connectors_config or {},
             "stage_type": self.stage_type,
             "engine_input_source": self.engine_input_source,
+            "is_prefill_only": self.is_prefill_only,
+            "is_decode_only": self.is_decode_only,
         }
         try:
             old_env = os.environ.get("VLLM_LOGGING_PREFIX")
@@ -557,6 +563,16 @@ class OmniStage:
             else:
                 _inject_global_id(ein)
 
+        # PD safeguard: store kv_transfer_params as a plain-dict backup in the
+        # payload so it definitely survives pickle even if the msgspec.Struct
+        # extra_args field is silently dropped.
+        if "_kv_transfer_params" not in payload:
+            sp = payload.get("sampling_params")
+            if sp is not None and hasattr(sp, "extra_args") and sp.extra_args:
+                kv_tp = sp.extra_args.get("kv_transfer_params")
+                if kv_tp is not None:
+                    payload["_kv_transfer_params"] = dict(kv_tp)
+
         self._in_q.put(payload)
 
     def try_collect(self) -> dict[str, Any] | None:
@@ -565,6 +581,8 @@ class OmniStage:
         Returns:
             Result dictionary if available, None otherwise. Result contains
             request_id, engine_outputs (or engine_outputs_shm), and metrics.
+            For prefill-only stages, also includes kv_transfer_params extracted
+            from vLLM's RequestOutput if available.
         """
         assert self._out_q is not None
         try:
@@ -641,6 +659,16 @@ def _stage_worker(
     from vllm_omni.plugins import load_omni_general_plugins
 
     load_omni_general_plugins()
+
+    # -- PD disaggregation: monkey-patch MooncakeConnector before engine init --
+    _is_prefill_only = stage_payload.get("is_prefill_only", False)
+    _is_decode_only = stage_payload.get("is_decode_only", False)
+    if _is_prefill_only or _is_decode_only:
+        _kv_cfg = stage_payload.get("engine_args", {}).get("kv_transfer_config", {})
+        _engine_id = _kv_cfg.get("engine_id") if isinstance(_kv_cfg, dict) else None
+        from vllm_omni.distributed.kv_transfer.monkey_patch import apply_mooncake_connector_patch
+        apply_mooncake_connector_patch(engine_id=_engine_id)
+
     # IMPORTANT: Ensure vLLM's internal multiprocessing workers (e.g., GPUARWorker /
     # GPUARModelRunner) are spawned with a fork-safe method.
     # Mooncake / gRPC / RDMA and CUDA/NCCL can deadlock under fork-with-threads.
@@ -834,6 +862,42 @@ def _stage_worker(
         # Ensure that the popped tasks are with identical sampling params. Take one of them.
         batch_engine_sampling_params: OmniSamplingParams = batch_tasks[0]["sampling_params"]
 
+        # PD safeguard: if the task carries _kv_transfer_params (backup key
+        # stored by the orchestrator), ensure it's present in the SP's
+        # extra_args.  msgspec.Struct pickle with omit_defaults=True may
+        # silently drop the extra_args dict in some environments.
+        _kv_backup = batch_tasks[0].get("_kv_transfer_params")
+        if _kv_backup is not None:
+            sp = batch_engine_sampling_params
+            if not isinstance(sp, SamplingParams):
+                pass  # diffusion or other non-SP type, skip
+            else:
+                if sp.extra_args is None:
+                    sp.extra_args = {}
+                if "kv_transfer_params" not in sp.extra_args:
+                    sp.extra_args["kv_transfer_params"] = _kv_backup
+                    # Use WARNING level so it's visible in worker sub-processes
+                    logger.warning(
+                        "[Stage-%d][PD] Restored kv_transfer_params from backup "
+                        "(pickle dropped extra_args): %s",
+                        stage_id,
+                        _kv_backup,
+                    )
+                else:
+                    _kv_p = sp.extra_args["kv_transfer_params"]
+                    logger.warning(
+                        "[Stage-%d][PD] kv_transfer_params present in SP extra_args "
+                        "(no backup needed): do_remote_decode=%s, "
+                        "do_remote_prefill=%s, remote_request_id=%s, "
+                        "remote_host=%s, remote_port=%s",
+                        stage_id,
+                        _kv_p.get("do_remote_decode"),
+                        _kv_p.get("do_remote_prefill"),
+                        _kv_p.get("remote_request_id", "NOT SET"),
+                        _kv_p.get("remote_host", "?"),
+                        _kv_p.get("remote_port", "?"),
+                    )
+
         batch_request_ids: list[Any] = []
         batch_engine_inputs: list[OmniPromptType] = []
         _rx_bytes_by_rid: dict[Any, int] = {}
@@ -914,6 +978,36 @@ def _stage_worker(
             _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
             logger.debug(f"Generate done: batch={len(batch_tasks)}, req_ids={batch_request_ids}, gen_ms={_gen_ms:.1f}")
 
+            # PD diagnostic: log output details for stages with kv_transfer_params
+            # NOTE: MooncakeConnector only adds to _reqs_need_send when
+            # finish_reason is 'length' (FINISHED_LENGTH_CAPPED).  Any other
+            # finish_reason (e.g. 'stop') causes the request to be added
+            # to _reqs_not_processed, effectively CANCELLING the KV transfer.
+            if _kv_backup is not None:
+                for ro in gen_outputs:
+                    _ro_kv = getattr(ro, "kv_transfer_params", None)
+                    _ro_ntoks = sum(len(o.token_ids) for o in ro.outputs) if hasattr(ro, "outputs") else "?"
+                    _ro_fr = getattr(ro.outputs[0], "finish_reason", None) if hasattr(ro, "outputs") and ro.outputs else None
+                    logger.warning(
+                        "[Stage-%d][PD] Engine output: engine_req_id=%s, "
+                        "num_output_tokens=%s, finish_reason=%s, "
+                        "kv_transfer_params=%s",
+                        stage_id,
+                        ro.request_id,
+                        _ro_ntoks,
+                        _ro_fr,
+                        _ro_kv,
+                    )
+                    if _ro_fr and str(_ro_fr) != "length":
+                        logger.warning(
+                            "[Stage-%d][PD] WARNING: finish_reason=%s is NOT "
+                            "'length' — MooncakeConnector will NOT send KV "
+                            "blocks. The decode engine will read uninitialized "
+                            "KV cache and produce garbled output!",
+                            stage_id,
+                            _ro_fr,
+                        )
+
             # Group outputs per request id with fallback
             req_to_outputs: dict[Any, list[Any]] = {rid: [] for rid in batch_request_ids}
             unmapped: list[Any] = []
@@ -927,6 +1021,13 @@ def _stage_worker(
                 idx = 0
                 for ro in unmapped:
                     target_rid = batch_request_ids[idx % len(batch_request_ids)]
+                    if _kv_backup is not None:
+                        logger.warning(
+                            "[Stage-%d][PD] Remapping engine_req_id=%s → "
+                            "orchestrator_req_id=%s (MooncakeConnector uses "
+                            "the engine_req_id internally)",
+                            stage_id, ro.request_id, target_rid,
+                        )
                     ro.request_id = target_rid
                     req_to_outputs[target_rid].append(ro)
                     idx += 1
@@ -1023,6 +1124,16 @@ async def _stage_worker_async(
     from vllm_omni.plugins import load_omni_general_plugins
 
     load_omni_general_plugins()
+
+    # -- PD disaggregation: monkey-patch MooncakeConnector before engine init --
+    _is_prefill_only = stage_payload.get("is_prefill_only", False)
+    _is_decode_only = stage_payload.get("is_decode_only", False)
+    if _is_prefill_only or _is_decode_only:
+        _kv_cfg = stage_payload.get("engine_args", {}).get("kv_transfer_config", {})
+        _engine_id = _kv_cfg.get("engine_id") if isinstance(_kv_cfg, dict) else None
+        from vllm_omni.distributed.kv_transfer.monkey_patch import apply_mooncake_connector_patch
+        apply_mooncake_connector_patch(engine_id=_engine_id)
+
     # IMPORTANT: Ensure vLLM's internal multiprocessing workers (e.g., GPUARWorker /
     # GPUARModelRunner) are spawned with a fork-safe method.
     if _os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") != "spawn":
