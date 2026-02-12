@@ -436,6 +436,8 @@ class OmniStage:
             "connectors_config": connectors_config or {},
             "stage_type": self.stage_type,
             "engine_input_source": self.engine_input_source,
+            "is_prefill_only": self.is_prefill_only,
+            "is_decode_only": self.is_decode_only,
         }
         try:
             old_env = os.environ.get("VLLM_LOGGING_PREFIX")
@@ -657,6 +659,16 @@ def _stage_worker(
     from vllm_omni.plugins import load_omni_general_plugins
 
     load_omni_general_plugins()
+
+    # -- PD disaggregation: monkey-patch MooncakeConnector before engine init --
+    _is_prefill_only = stage_payload.get("is_prefill_only", False)
+    _is_decode_only = stage_payload.get("is_decode_only", False)
+    if _is_prefill_only or _is_decode_only:
+        _kv_cfg = stage_payload.get("engine_args", {}).get("kv_transfer_config", {})
+        _engine_id = _kv_cfg.get("engine_id") if isinstance(_kv_cfg, dict) else None
+        from vllm_omni.distributed.kv_transfer.monkey_patch import apply_mooncake_connector_patch
+        apply_mooncake_connector_patch(engine_id=_engine_id)
+
     # IMPORTANT: Ensure vLLM's internal multiprocessing workers (e.g., GPUARWorker /
     # GPUARModelRunner) are spawned with a fork-safe method.
     # Mooncake / gRPC / RDMA and CUDA/NCCL can deadlock under fork-with-threads.
@@ -1112,6 +1124,16 @@ async def _stage_worker_async(
     from vllm_omni.plugins import load_omni_general_plugins
 
     load_omni_general_plugins()
+
+    # -- PD disaggregation: monkey-patch MooncakeConnector before engine init --
+    _is_prefill_only = stage_payload.get("is_prefill_only", False)
+    _is_decode_only = stage_payload.get("is_decode_only", False)
+    if _is_prefill_only or _is_decode_only:
+        _kv_cfg = stage_payload.get("engine_args", {}).get("kv_transfer_config", {})
+        _engine_id = _kv_cfg.get("engine_id") if isinstance(_kv_cfg, dict) else None
+        from vllm_omni.distributed.kv_transfer.monkey_patch import apply_mooncake_connector_patch
+        apply_mooncake_connector_patch(engine_id=_engine_id)
+
     # IMPORTANT: Ensure vLLM's internal multiprocessing workers (e.g., GPUARWorker /
     # GPUARModelRunner) are spawned with a fork-safe method.
     if _os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") != "spawn":
