@@ -165,18 +165,21 @@ def _merge_pd_embeddings(
     decode_hid: torch.Tensor,
     prefill_mm: dict[str, Any],
     device: torch.device,
+    expected_total: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Merge prefill prompt embeddings with decode generated embeddings.
 
     In PD disaggregation the decode engine only produces embeddings for the
-    tokens it actually computed (1 remaining-prompt + N generated).  The
-    prefill engine has embeddings for the full prompt.  We concatenate them
-    so the talker sees the complete sequence::
+    tokens it actually computed.  The prefill engine has embeddings for the
+    full prompt.  We concatenate them, dynamically computing any overlap::
 
-        merged = prefill[0 : prompt_len] + decode[1:]
-                         ^                        ^
-                    prompt positions       generated positions
-                                      (skip overlap at last prompt pos)
+        overlap = prefill_len + decode_len - expected_total
+        merged  = prefill + decode[overlap:]
+
+    When ``expected_total`` (= len(prompt_token_ids) + len(output.token_ids))
+    is provided we use it to decide how many leading decode embeddings to
+    skip (they duplicate trailing prefill positions).  If not provided we
+    fall back to no-skip concatenation.
     """
     try:
         p_emb = prefill_mm["0"].detach().to(device=device, dtype=torch.float)
@@ -187,15 +190,23 @@ def _merge_pd_embeddings(
     if p_emb.shape[0] == 0 or decode_emb.shape[0] == 0:
         return decode_emb, decode_hid
 
-    # decode[0] is the recomputed last-prompt-token (overlap with prefill[-1]).
-    merged_emb = torch.cat([p_emb, decode_emb[1:]], dim=0)
-    merged_hid = torch.cat([p_hid, decode_hid[1:]], dim=0)
+    raw_total = p_emb.shape[0] + decode_emb.shape[0]
+    if expected_total is not None and raw_total > expected_total:
+        overlap = raw_total - expected_total
+    else:
+        overlap = 0
+
+    merged_emb = torch.cat([p_emb, decode_emb[overlap:]], dim=0)
+    merged_hid = torch.cat([p_hid, decode_hid[overlap:]], dim=0)
 
     logger.info(
-        "[PD] Merged prefill(%d) + decode(%d) → %d embeddings",
+        "[PD] Merged prefill(%d) + decode(%d) overlap=%d → %d embeddings "
+        "(expected=%s)",
         p_emb.shape[0],
         decode_emb.shape[0],
+        overlap,
         merged_emb.shape[0],
+        expected_total,
     )
     return merged_emb, merged_hid
 
@@ -246,6 +257,19 @@ def thinker2talker(
         decode_emb = output.multimodal_output["0"].detach().to(device=device, dtype=torch.float)
         decode_hid = output.multimodal_output["24"].detach().to(device=device, dtype=torch.float)
 
+        # Expected total = prompt tokens + generated tokens (the full sequence).
+        expected_total = len(thinker_output.prompt_token_ids) + len(output.token_ids)
+
+        logger.info(
+            "[PD] thinker2talker: prompt_len=%d, output_len=%d, "
+            "expected_total=%d, decode_emb=%d, decode_hid=%d",
+            len(thinker_output.prompt_token_ids),
+            len(output.token_ids),
+            expected_total,
+            decode_emb.shape[0],
+            decode_hid.shape[0],
+        )
+
         # Merge prefill prompt embeddings when running in PD mode.
         if prefill_stage is not None:
             try:
@@ -254,6 +278,7 @@ def thinker2talker(
                 prefill_mm = prefill_eo.outputs[0].multimodal_output
                 decode_emb, decode_hid = _merge_pd_embeddings(
                     decode_emb, decode_hid, prefill_mm, device,
+                    expected_total=expected_total,
                 )
             except Exception as exc:
                 logger.warning("[PD] Could not merge prefill embeddings: %s", exc)
