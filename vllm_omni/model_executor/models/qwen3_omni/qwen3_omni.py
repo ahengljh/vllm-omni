@@ -788,17 +788,29 @@ class Qwen3OmniMoeForConditionalGeneration(
         Returns:
             (input_ids, input_embeds) for talker
         """
-        # Use the minimum length across thinker_result_ids, thinker_embed and
-        # thinker_hidden so that segment boundaries never exceed any tensor.
-        seq_len = min(
-            thinker_result_ids.shape[-1],
-            thinker_embed.shape[0],
-            thinker_hidden.shape[0],
-        )
+        # Pad thinker_embed / thinker_hidden to match thinker_result_ids length
+        # so that all downstream slices use consistent indices.  The mismatch
+        # can happen when the thinker sequence includes generated tokens that
+        # don't have corresponding embeddings (e.g. in PD disaggregation).
+        target_len = thinker_result_ids.shape[-1]
+        if thinker_embed.shape[0] < target_len:
+            pad_len = target_len - thinker_embed.shape[0]
+            thinker_embed = torch.cat(
+                (thinker_embed, torch.zeros(pad_len, thinker_embed.shape[1],
+                                            device=thinker_embed.device, dtype=thinker_embed.dtype)),
+                dim=0,
+            )
+        if thinker_hidden.shape[0] < target_len:
+            pad_len = target_len - thinker_hidden.shape[0]
+            thinker_hidden = torch.cat(
+                (thinker_hidden, torch.zeros(pad_len, thinker_hidden.shape[1],
+                                             device=thinker_hidden.device, dtype=thinker_hidden.dtype)),
+                dim=0,
+            )
         im_start_indexes = torch.cat(
             (
                 torch.nonzero(input_ids[0] == self.config.im_start_token_id).squeeze(),
-                torch.tensor([seq_len], device=input_ids.device, dtype=input_ids.dtype),
+                torch.tensor([target_len], device=input_ids.device, dtype=input_ids.dtype),
             ),
             dim=-1,
         )  # Shape [n_starts + 1]; Take batch 0 since batched inference is not supported here.
