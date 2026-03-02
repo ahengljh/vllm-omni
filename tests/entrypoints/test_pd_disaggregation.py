@@ -236,18 +236,19 @@ def _setup_ipc_mocks(monkeypatch):
 
 
 def _setup_log_mocks(monkeypatch):
-    class _FakeOrchestratorMetrics:
-        def __init__(self, num_stages, enable_stats, wall_start_ts):
+    class _FakeOrchestratorAggregator:
+        def __init__(self, num_stages, enable_stats, wall_start_ts, final_stage_id_for_e2e=None):
             self.num_stages = num_stages
             self.enable_stats = enable_stats
             self.stage_first_ts = [None] * num_stages
             self.stage_last_ts = [None] * num_stages
             self.stage_total_tokens = [0] * num_stages
+            self.accumulated_gen_time_ms = {}
             self.e2e_done = set()
             self.e2e_count = 0
             self.e2e_total_ms = 0.0
 
-        def on_stage_metrics(self, stage_id, req_id, metrics):
+        def on_stage_metrics(self, stage_id, req_id, metrics, final_output_type=None):
             pass
 
         def on_finalize_request(self, stage_id, req_id, start_ts):
@@ -256,12 +257,25 @@ def _setup_log_mocks(monkeypatch):
         def on_forward(self, from_stage, to_stage, req_id, size_bytes, tx_ms, use_shm):
             pass
 
-        def build_and_log_summary(self, final_stage_id):
+        def accumulate_diffusion_metrics(self, stage_type, req_id, engine_outputs):
+            pass
+
+        def record_audio_generated_frames(self, output, stage_id, req_id):
+            pass
+
+        def stage_postprocess_timer(self, stage_id, req_id):
+            from contextlib import contextmanager
+            @contextmanager
+            def _noop():
+                yield
+            return _noop()
+
+        def build_and_log_summary(self):
             return "Fake summary"
 
     monkeypatch.setattr(
-        "vllm_omni.entrypoints.omni.OrchestratorMetrics",
-        _FakeOrchestratorMetrics,
+        "vllm_omni.entrypoints.omni.OrchestratorAggregator",
+        _FakeOrchestratorAggregator,
         raising=False,
     )
 
@@ -348,6 +362,9 @@ def mock_get_config(monkeypatch):
 def _make_pd_omni(monkeypatch, stage_configs, *, extra_setup=None):
     """Create an Omni instance whose stage_list consists of _FakeStage objects
     built from *stage_configs* (list of dicts).
+
+    Mocks the full init chain so no real model download, connector init,
+    or stage process creation occurs.
     """
     _clear_modules()
     _setup_engine_mocks(monkeypatch)
@@ -357,10 +374,17 @@ def _make_pd_omni(monkeypatch, stage_configs, *, extra_setup=None):
 
     configs = [_FakeStageConfig(c) for c in stage_configs]
 
-    def _fake_loader(model: str, base_engine_args=None):
-        return configs
+    # Mock load_and_resolve_stage_configs (the current entry point used by
+    # OmniBase._resolve_stage_configs).  It returns (config_path, stage_configs).
+    def _fake_load_and_resolve(model, stage_configs_path=None, kwargs=None, **kw):
+        return ("fake_config_path", configs)
 
-    monkeypatch.setattr("vllm_omni.entrypoints.utils.load_stage_configs_from_model", _fake_loader, raising=False)
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
+        _fake_load_and_resolve,
+        raising=False,
+    )
+
     monkeypatch.setattr(
         "vllm_omni.entrypoints.omni_stage.OmniStage",
         lambda cfg, **kwargs: _FakeStage(cfg, **kwargs),
@@ -369,8 +393,57 @@ def _make_pd_omni(monkeypatch, stage_configs, *, extra_setup=None):
 
     import vllm_omni.entrypoints.omni as omni_module
 
-    monkeypatch.setattr(omni_module, "load_stage_configs_from_model", _fake_loader)
+    # Mock load_and_resolve_stage_configs on the omni module (it's imported
+    # from utils at the top of omni.py).
+    monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_load_and_resolve)
     monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+
+    # Mock omni_snapshot_download so it doesn't try to download a real model
+    monkeypatch.setattr(omni_module, "omni_snapshot_download", lambda model_id: model_id)
+
+    # Build a connectors dict that covers all edges so that
+    # try_send_via_connector is always called (it sends data to the
+    # next stage's input queue).
+    num_stages = len(configs)
+    fake_connectors = {}
+    for i in range(num_stages - 1):
+        fake_connectors[(str(i), str(i + 1))] = MagicMock()
+
+    # Mock initialize_orchestrator_connectors so it doesn't parse real configs
+    monkeypatch.setattr(
+        omni_module, "initialize_orchestrator_connectors",
+        lambda *args, **kwargs: (None, fake_connectors),
+    )
+
+    # Mock try_send_via_connector to directly submit to the stage queue
+    # (the real version uses OmniConnector IPC; in tests we just put the
+    # payload into the stage's input queue directly).
+    def _fake_try_send(connector, stage_id, next_stage_id, req_id,
+                       next_inputs, sampling_params, original_prompt,
+                       next_stage_queue_submit_fn, metrics):
+        task = {
+            "request_id": req_id,
+            "engine_inputs": next_inputs,
+            "sampling_params": sampling_params,
+        }
+        next_stage_queue_submit_fn(task)
+        return True
+
+    monkeypatch.setattr(omni_module, "try_send_via_connector", _fake_try_send)
+
+    # Mock _start_stages to create fake queues (the real version uses ZMQ
+    # sockets, multiprocessing contexts, and spawns stage workers).
+    def _fake_start_stages(self, model):
+        for stage in self.stage_list:
+            in_q = _FakeQueue()
+            out_q = _FakeQueue()
+            self._stage_in_queues.append(in_q)
+            self._stage_out_queues.append(out_q)
+            stage.attach_queues(in_q, out_q)
+
+    from vllm_omni.entrypoints.omni import OmniBase
+    monkeypatch.setattr(OmniBase, "_start_stages", _fake_start_stages)
+    monkeypatch.setattr(OmniBase, "_wait_for_stages_ready", lambda self, timeout=120: None)
 
     if extra_setup:
         extra_setup(monkeypatch, omni_module)
@@ -1002,6 +1075,8 @@ class TestMooncakeConnectorPatch:
         stage.is_decode_only = False
         stage.stage_type = "llm"
         stage.engine_input_source = []
+        stage.final_output = False
+        stage.final_output_type = None
         stage._shm_threshold_bytes = 65536
         stage._stage_init_timeout = 300
         stage._in_q = MagicMock()
