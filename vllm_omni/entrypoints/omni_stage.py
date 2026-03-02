@@ -47,8 +47,8 @@ from vllm_omni.entrypoints.stage_utils import (
     _resolve_model_tokenizer_paths,
     _to_dict,
     is_profiler_task,
-    load_func_from_config,
     maybe_dump_to_shm,
+    maybe_load_from_ipc,
     set_stage_devices,
 )
 from vllm_omni.entrypoints.utils import detect_pid_host, filter_dataclass_kwargs
@@ -277,6 +277,9 @@ class OmniStage:
             and self.stage_id is not None
         ):
             stage_config.engine_args.stage_id = self.stage_id
+        # PD disaggregation flags
+        self.is_prefill_only: bool = getattr(stage_config, "is_prefill_only", False)
+        self.is_decode_only: bool = getattr(stage_config, "is_decode_only", False)
         if hasattr(stage_config, "custom_process_input_func"):
             # Import the module specified in the config (already a full module path)
             module_path, func_name = stage_config.custom_process_input_func.rsplit(".", 1)
@@ -285,7 +288,6 @@ class OmniStage:
         else:
             self.custom_process_input_func = None
 
-        self.prompt_expand_func = load_func_from_config(getattr(stage_config, "prompt_expand_func", None))
         self.final_output = getattr(stage_config, "final_output", False)
         self.final_output_type = getattr(stage_config, "final_output_type", None)
         self.tts_args = _to_dict(getattr(stage_config, "tts_args", {}))
@@ -466,9 +468,10 @@ class OmniStage:
             "connectors_config": connectors_config or {},
             "stage_type": self.stage_type,
             "engine_input_source": self.engine_input_source,
-            "cfg_kv_collect_func": getattr(self.stage_config, "cfg_kv_collect_func", None),
             "final_output": self.final_output,
             "final_output_type": self.final_output_type,
+            "is_prefill_only": self.is_prefill_only,
+            "is_decode_only": self.is_decode_only,
         }
         try:
             old_env = os.environ.get("VLLM_LOGGING_PREFIX")
@@ -603,6 +606,19 @@ class OmniStage:
             else:
                 _inject_global_id(ein)
 
+        # PD safeguard: store kv_transfer_params as a plain-dict backup in the
+        # payload so it definitely survives pickle even if the msgspec.Struct
+        # extra_args field is silently dropped (observed with omit_defaults=True
+        # in SamplingParams).  The backup fires only when _kv_transfer_params
+        # is not already in the payload, so overhead is minimal.
+        # TODO: open vLLM issue if confirmed reproducible
+        if "_kv_transfer_params" not in payload:
+            sp = payload.get("sampling_params")
+            if sp is not None and hasattr(sp, "extra_args") and sp.extra_args:
+                kv_tp = sp.extra_args.get("kv_transfer_params")
+                if kv_tp is not None:
+                    payload["_kv_transfer_params"] = dict(kv_tp)
+
         self._in_q.put(payload)
 
     def try_collect(self) -> dict[str, Any] | None:
@@ -611,6 +627,8 @@ class OmniStage:
         Returns:
             Result dictionary if available, None otherwise. Result contains
             request_id, engine_outputs (or engine_outputs_shm), and metrics.
+            For prefill-only stages, also includes kv_transfer_params extracted
+            from vLLM's RequestOutput if available.
         """
         assert self._out_q is not None
         try:
@@ -619,11 +637,7 @@ class OmniStage:
             return None
 
     def process_engine_inputs(
-        self,
-        stage_list: list[Any],
-        prompt: OmniTokensPrompt | TextPrompt = None,
-        *,
-        source_outputs_override: Any = None,
+        self, stage_list: list[Any], prompt: OmniTokensPrompt | TextPrompt = None
     ) -> list[OmniTokensPrompt | TextPrompt]:
         """Process engine inputs for this stage from upstream stage outputs.
 
@@ -634,8 +648,6 @@ class OmniStage:
         Args:
             stage_list: List of all stages in the pipeline
             prompt: Optional original prompt (for multimodal data preservation)
-            source_outputs_override: Use these outputs instead of reading from
-                the source stage's ``engine_outputs`` (for deferred CFG requests).
 
         Returns:
             List of processed engine inputs ready for this stage
@@ -648,11 +660,7 @@ class OmniStage:
             if len(self.engine_input_source) == 0:
                 raise ValueError("engine_input_source is empty")
             source_stage_id = self.engine_input_source[0]
-            source_outputs = (
-                source_outputs_override
-                if source_outputs_override is not None
-                else stage_list[source_stage_id].engine_outputs
-            )
+            source_outputs = stage_list[source_stage_id].engine_outputs
             if not isinstance(prompt, list):
                 prompt = [prompt]
             multi_modal_data = {
@@ -674,18 +682,6 @@ class OmniStage:
 
         else:
             engine_input_source = self.engine_input_source
-            if source_outputs_override is not None and engine_input_source:
-                # Temporarily swap engine_outputs so custom_process_input_func
-                # (which reads stage_list directly) sees the correct data.
-                _source_id = engine_input_source[0]
-                _orig_outputs = stage_list[_source_id].engine_outputs
-                stage_list[_source_id].engine_outputs = source_outputs_override
-                try:
-                    return self.custom_process_input_func(
-                        stage_list, engine_input_source, prompt, self.requires_multimodal_data
-                    )
-                finally:
-                    stage_list[_source_id].engine_outputs = _orig_outputs
             return self.custom_process_input_func(
                 stage_list, engine_input_source, prompt, self.requires_multimodal_data
             )
@@ -711,6 +707,16 @@ def _stage_worker(
     from vllm_omni.plugins import load_omni_general_plugins
 
     load_omni_general_plugins()
+
+    # -- PD disaggregation: monkey-patch MooncakeConnector before engine init --
+    _is_prefill_only = stage_payload.get("is_prefill_only", False)
+    _is_decode_only = stage_payload.get("is_decode_only", False)
+    if _is_prefill_only or _is_decode_only:
+        _kv_cfg = stage_payload.get("engine_args", {}).get("kv_transfer_config", {})
+        _engine_id = _kv_cfg.get("engine_id") if isinstance(_kv_cfg, dict) else None
+        from vllm_omni.distributed.kv_transfer.monkey_patch import apply_mooncake_connector_patch
+        apply_mooncake_connector_patch(engine_id=_engine_id)
+
     # IMPORTANT: Ensure vLLM's internal multiprocessing workers (e.g., GPUARWorker /
     # GPUARModelRunner) are spawned with a fork-safe method.
     # Mooncake / gRPC / RDMA and CUDA/NCCL can deadlock under fork-with-threads.
@@ -730,8 +736,6 @@ def _stage_worker(
     shm_threshold_bytes = int(stage_payload.get("shm_threshold_bytes", 65536))
     connectors_config = stage_payload.get("connectors_config", {})
     stage_type: Literal["llm", "diffusion"] = stage_payload.get("stage_type", "llm")
-
-    cfg_kv_collect_func = load_func_from_config(stage_payload.get("cfg_kv_collect_func"))
 
     if stage_type != "diffusion":
         _resolve_worker_cls(engine_args)
@@ -792,7 +796,6 @@ def _stage_worker(
                 model=model,
                 stage_id=stage_id,
                 engine_input_source=stage_payload.get("engine_input_source", []),
-                cfg_kv_collect_func=cfg_kv_collect_func,
                 **engine_args,
             )
         else:
@@ -928,6 +931,24 @@ def _stage_worker(
         # Ensure that the popped tasks are with identical sampling params. Take one of them.
         batch_engine_sampling_params: OmniSamplingParams = batch_tasks[0]["sampling_params"]
 
+        # PD safeguard: if the task carries _kv_transfer_params (backup key
+        # stored by the orchestrator), ensure it's present in the SP's
+        # extra_args.  msgspec.Struct pickle with omit_defaults=True may
+        # silently drop the extra_args dict in some environments.
+        _kv_backup = batch_tasks[0].get("_kv_transfer_params")
+        if _kv_backup is not None:
+            sp = batch_engine_sampling_params
+            if isinstance(sp, SamplingParams):
+                if sp.extra_args is None:
+                    sp.extra_args = {}
+                if "kv_transfer_params" not in sp.extra_args:
+                    sp.extra_args["kv_transfer_params"] = _kv_backup
+                    logger.warning(
+                        "[Stage-%d][PD] Restored kv_transfer_params from "
+                        "backup (pickle dropped extra_args)",
+                        stage_id,
+                    )
+
         batch_request_ids: list[Any] = []
         batch_engine_inputs: list[OmniPromptType] = []
         _rx_bytes_by_rid: dict[Any, int] = {}
@@ -1008,6 +1029,20 @@ def _stage_worker(
             _gen_t1 = _time.time()
             _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
             logger.debug(f"Generate done: batch={len(batch_tasks)}, req_ids={batch_request_ids}, gen_ms={_gen_ms:.1f}")
+
+            # PD check: MooncakeConnector only sends KV when
+            # finish_reason is 'length' (FINISHED_LENGTH_CAPPED).
+            if _kv_backup is not None:
+                for ro in gen_outputs:
+                    _ro_fr = getattr(ro.outputs[0], "finish_reason", None) if hasattr(ro, "outputs") and ro.outputs else None
+                    if _ro_fr and str(_ro_fr) != "length":
+                        logger.warning(
+                            "[Stage-%d][PD] finish_reason=%s (not 'length') "
+                            "— KV transfer will be skipped for req %s",
+                            stage_id,
+                            _ro_fr,
+                            ro.request_id,
+                        )
 
             # Group outputs per request id with fallback
             req_to_outputs: dict[Any, list[Any]] = {rid: [] for rid in batch_request_ids}
@@ -1122,6 +1157,16 @@ async def _stage_worker_async(
     from vllm_omni.plugins import load_omni_general_plugins
 
     load_omni_general_plugins()
+
+    # -- PD disaggregation: monkey-patch MooncakeConnector before engine init --
+    _is_prefill_only = stage_payload.get("is_prefill_only", False)
+    _is_decode_only = stage_payload.get("is_decode_only", False)
+    if _is_prefill_only or _is_decode_only:
+        _kv_cfg = stage_payload.get("engine_args", {}).get("kv_transfer_config", {})
+        _engine_id = _kv_cfg.get("engine_id") if isinstance(_kv_cfg, dict) else None
+        from vllm_omni.distributed.kv_transfer.monkey_patch import apply_mooncake_connector_patch
+        apply_mooncake_connector_patch(engine_id=_engine_id)
+
     # IMPORTANT: Ensure vLLM's internal multiprocessing workers (e.g., GPUARWorker /
     # GPUARModelRunner) are spawned with a fork-safe method.
     if _os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") != "spawn":
@@ -1141,7 +1186,6 @@ async def _stage_worker_async(
     final_output = stage_payload.get("final_output", False)
     final_output_type = stage_payload.get("final_output_type", None)
 
-    cfg_kv_collect_func = load_func_from_config(stage_payload.get("cfg_kv_collect_func"))
     # Handle non-standard model directory structures (e.g., tokenizer in root, model in subdir)
     model = _resolve_model_tokenizer_paths(model, engine_args)
 
@@ -1220,13 +1264,10 @@ async def _stage_worker_async(
             od_config["omni_kv_config"]["engine_input_source"] = stage_payload.get("engine_input_source", [])
 
             logger.debug(f"[Stage-%s] Initializing diffusion engine with config: {od_config}", stage_id)
-            _diffusion_kwargs = {k: v for k, v in engine_args.items() if k not in {"od_config", "model"}}
-            if cfg_kv_collect_func is not None:
-                _diffusion_kwargs["cfg_kv_collect_func"] = cfg_kv_collect_func
             stage_engine = AsyncOmniDiffusion(
                 model=model,
                 od_config=od_config,
-                **_diffusion_kwargs,
+                **{k: v for k, v in engine_args.items() if k not in {"od_config", "model"}},
             )
             vllm_config = None  # Diffusion doesn't use vllm_config
         else:

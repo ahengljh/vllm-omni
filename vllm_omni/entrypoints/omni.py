@@ -9,6 +9,8 @@ import uuid
 import weakref
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, is_dataclass
+from pprint import pformat
 from typing import Any, Literal, overload
 
 import huggingface_hub
@@ -34,7 +36,6 @@ from vllm_omni.distributed.ray_utils.utils import (
     get_ray_queue_class,
     try_close_ray,
 )
-from vllm_omni.entrypoints.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
@@ -50,6 +51,10 @@ from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
 from vllm_omni.outputs import OmniRequestOutput
+
+# Default port for Mooncake KV transfer bootstrap service.
+# Used when ``mooncake_bootstrap_port`` is not set in kv_connector_extra_config.
+_DEFAULT_MOONCAKE_BOOTSTRAP_PORT = 25201
 
 logger = init_logger(__name__)
 
@@ -181,6 +186,26 @@ class OmniBase:
         # based on stage_type in YAML config (handled in omni_stage.py)
         logger.info(f"Initializing stages for model: {model}")
         self._initialize_stages(model, kwargs)
+
+        # PD disaggregation: detect prefill-decode stage pair
+        self._pd_separation_pair: tuple[int, int] | None = self._detect_pd_separation()
+        self._pd_connector_info: dict[str, Any] | None = None
+        self._pd_kv_params_by_req: dict[str, dict[str, Any]] = {}
+        # Lock protects _pd_kv_params_by_req for the async path (AsyncOmni)
+        # where store and pop may run from different coroutines.  In the sync
+        # path (_run_generation) store and pop happen sequentially in the same
+        # thread, but the lock is harmless and keeps the code uniform.
+        self._pd_kv_params_lock = threading.Lock()
+        if self._pd_separation_pair is not None:
+            self._validate_pd_separation_config()
+            self._pd_connector_info = self._get_pd_connector_info()
+            p_id, d_id = self._pd_separation_pair
+            logger.info(
+                "[%s] PD disaggregation detected: prefill=stage-%d, decode=stage-%d",
+                self._name,
+                p_id,
+                d_id,
+            )
 
     def _get_default_cache_config(self, cache_backend: str | None) -> dict[str, Any] | None:
         if cache_backend == "cache_dit":
@@ -764,6 +789,285 @@ class OmniBase:
     def is_async(self) -> bool:
         return False
 
+# ------------------------------------------------------------------
+    # PD (Prefill-Decode) disaggregation helpers
+    # ------------------------------------------------------------------
+
+    def _detect_pd_separation(self) -> tuple[int, int] | None:
+        """Scan stage_list for a prefill-only / decode-only pair.
+
+        Returns:
+            ``(prefill_stage_id, decode_stage_id)`` if found, else ``None``.
+
+        Raises:
+            ValueError: If multiple PD pairs are detected (not supported).
+        """
+        # Single pass: collect prefill stages keyed by both list index and
+        # stage_id so decode stages can match against either.
+        prefill_by_id: dict[int, int] = {}  # stage_id_or_index → list index
+        decode_indices: list[int] = []
+        for i, stage in enumerate(self.stage_list):
+            if getattr(stage, "is_prefill_only", False):
+                prefill_by_id[i] = i
+                sid = getattr(stage, "stage_id", i)
+                if sid != i:
+                    prefill_by_id[sid] = i
+            if getattr(stage, "is_decode_only", False):
+                decode_indices.append(i)
+
+        # Match decode stages to prefill stages via engine_input_source.
+        # This is O(d*s) where d = number of decode stages (typically 1)
+        # and s = number of source IDs per decode stage (typically 1..2).
+        pd_pairs: list[tuple[int, int]] = []
+        for j in decode_indices:
+            source_ids = getattr(self.stage_list[j], "engine_input_source", [])
+            for src in source_ids:
+                if src in prefill_by_id:
+                    pd_pairs.append((prefill_by_id[src], j))
+                    break
+
+        if len(pd_pairs) > 1:
+            raise ValueError(
+                f"Multiple PD pairs detected ({pd_pairs}); "
+                "only a single PD pair per pipeline is supported"
+            )
+        return pd_pairs[0] if pd_pairs else None
+
+    @staticmethod
+    def _to_dict(obj: Any, default: Any = None) -> dict[str, Any] | None:
+        """Convert *obj* to a plain ``dict``, trying several strategies.
+
+        Returns *default* when *obj* is ``None`` or conversion fails.
+        Typical usage::
+
+            self._to_dict(kv_cfg, default={})   # replaces _kv_cfg_to_dict
+            self._to_dict(kv_params)             # replaces _normalize_kv_transfer_params
+        """
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            return obj
+        if is_dataclass(obj):
+            try:
+                return asdict(obj)
+            except Exception:
+                return default
+        for attr in ("model_dump", "dict"):
+            if hasattr(obj, attr):
+                try:
+                    return getattr(obj, attr)()
+                except Exception:
+                    pass
+        if hasattr(obj, "items"):
+            try:
+                return dict(obj)
+            except Exception:
+                pass
+        try:
+            return dict(obj)
+        except Exception:
+            try:
+                return vars(obj)
+            except Exception:
+                logger.debug(
+                    "Unable to convert object of type %s to dict",
+                    type(obj),
+                )
+                return default
+
+    # Intentional thin wrappers over _to_dict with different defaults:
+    # _kv_cfg_to_dict returns {} (never None) for safe .get() chains.
+    # _normalize_kv_transfer_params returns None when absent (caller checks).
+    def _kv_cfg_to_dict(self, kv_cfg: Any) -> dict[str, Any]:
+        return self._to_dict(kv_cfg, default={}) or {}
+
+    def _normalize_kv_transfer_params(self, kv_params: Any) -> dict[str, Any] | None:
+        return self._to_dict(kv_params)
+
+    def _validate_pd_separation_config(self) -> None:
+        """Validate that PD stage configurations are consistent."""
+        assert self._pd_separation_pair is not None
+        p_id, d_id = self._pd_separation_pair
+        p_stage = self.stage_list[p_id]
+        d_stage = self.stage_list[d_id]
+
+        def _get_kv_cfg(stage: OmniStage) -> dict[str, Any]:
+            ea = stage.engine_args
+            cfg = getattr(ea, "kv_transfer_config", None)
+            if cfg is None:
+                cfg = ea.get("kv_transfer_config", None) if hasattr(ea, "get") else None
+            if cfg is None:
+                raise ValueError(
+                    f"Stage-{stage.stage_id} is marked for PD disaggregation "
+                    "but has no 'kv_transfer_config' in engine_args"
+                )
+            cfg_dict = self._kv_cfg_to_dict(cfg)
+            if not cfg_dict:
+                raise ValueError(
+                    f"Stage-{stage.stage_id} kv_transfer_config "
+                    f"({type(cfg).__name__}) could not be parsed into a dict"
+                )
+            return cfg_dict
+
+        p_cfg = _get_kv_cfg(p_stage)
+        d_cfg = _get_kv_cfg(d_stage)
+
+        p_role = p_cfg.get("kv_role")
+        d_role = d_cfg.get("kv_role")
+        if p_role not in ("kv_producer", "kv_both"):
+            raise ValueError(
+                f"Prefill stage-{p_id} kv_role must be 'kv_producer' or "
+                f"'kv_both', got '{p_role}'"
+            )
+        if d_role not in ("kv_consumer", "kv_both"):
+            raise ValueError(
+                f"Decode stage-{d_id} kv_role must be 'kv_consumer' or "
+                f"'kv_both', got '{d_role}'"
+            )
+
+        d_sources = list(getattr(d_stage, "engine_input_source", []) or [])
+        if p_id not in d_sources and p_stage.stage_id not in d_sources:
+            raise ValueError(
+                f"Decode stage-{d_id} must list prefill stage-{p_id} in engine_input_source"
+            )
+
+        p_conn = p_cfg.get("kv_connector")
+        d_conn = d_cfg.get("kv_connector")
+        if p_conn != d_conn:
+            raise ValueError(
+                f"PD connector mismatch: prefill uses '{p_conn}', "
+                f"decode uses '{d_conn}'"
+            )
+        if not p_conn:
+            raise ValueError("PD disaggregation requires kv_connector to be set in kv_transfer_config")
+
+        for key in ("kv_buffer_device", "kv_buffer_size"):
+            p_val = p_cfg.get(key)
+            d_val = d_cfg.get(key)
+            if p_val is not None and d_val is not None and p_val != d_val:
+                raise ValueError(
+                    f"PD {key} mismatch: prefill uses '{p_val}', decode uses '{d_val}'"
+                )
+
+        # Validate tensor_parallel_size matches between prefill and decode
+        p_tp = getattr(getattr(p_stage, "engine_args", None), "tensor_parallel_size", 1)
+        d_tp = getattr(getattr(d_stage, "engine_args", None), "tensor_parallel_size", 1)
+        if p_tp != d_tp:
+            raise ValueError(
+                f"PD stages must have matching tensor_parallel_size: "
+                f"prefill={p_tp}, decode={d_tp}"
+            )
+
+    def _get_pd_connector_info(self) -> dict[str, Any] | None:
+        """Extract prefill engine KV connector info from stage config."""
+        if self._pd_separation_pair is None:
+            return None
+
+        p_id, _ = self._pd_separation_pair
+        p_stage = self.stage_list[p_id]
+
+        ea = p_stage.engine_args
+        kv_cfg = getattr(ea, "kv_transfer_config", None)
+        if kv_cfg is None and hasattr(ea, "get"):
+            kv_cfg = ea.get("kv_transfer_config")
+        if kv_cfg is None:
+            return None
+
+        kv_cfg_dict = self._kv_cfg_to_dict(kv_cfg)
+        if not kv_cfg_dict:
+            return None
+
+        engine_id = kv_cfg_dict.get("engine_id")
+        kv_connector = str(kv_cfg_dict.get("kv_connector", "") or "")
+        extra_cfg = kv_cfg_dict.get("kv_connector_extra_config", {}) or {}
+        if not isinstance(extra_cfg, dict):
+            extra_cfg = self._kv_cfg_to_dict(extra_cfg)
+
+        info: dict[str, Any] = {"prefill_engine_id": engine_id}
+
+        if "mooncake" in kv_connector.lower():
+            bootstrap_port = extra_cfg.get("mooncake_bootstrap_port", None)
+            if bootstrap_port is None:
+                bootstrap_port = _DEFAULT_MOONCAKE_BOOTSTRAP_PORT
+            kv_ip = kv_cfg_dict.get("kv_ip") or "127.0.0.1"
+            info["prefill_bootstrap_addr"] = f"{kv_ip}:{bootstrap_port}"
+
+        logger.debug("[%s] PD connector info: %s", self._name, info)
+        return info
+
+    def _prepare_prefill_sampling_params(self, req_id: str, sp: SamplingParams) -> SamplingParams:
+        sp = sp.clone()
+        sp.max_tokens = 1
+        if hasattr(sp, "min_tokens"):
+            try:
+                sp.min_tokens = 1
+            except Exception:
+                pass
+        # Neutralize stop conditions so the prefill always finishes with
+        # finish_reason='length' (not 'stop').  MooncakeConnector cancels
+        # KV transfer for any reason other than FINISHED_LENGTH_CAPPED.
+        sp.stop = []
+        sp.stop_token_ids = []
+        sp.include_stop_str_in_output = False
+        if sp.extra_args is None:
+            sp.extra_args = {}
+        kv_params = self._normalize_kv_transfer_params(sp.extra_args.get("kv_transfer_params"))
+        merged: dict[str, Any] = {}
+        if kv_params:
+            merged.update(kv_params)
+        merged.update(
+            {
+                "do_remote_decode": True,
+                "do_remote_prefill": False,
+                "transfer_id": f"xfer-{req_id}",
+            }
+        )
+        sp.extra_args["kv_transfer_params"] = merged
+        logger.debug(
+            "[PD] _prepare_prefill_sampling_params: req=%s max_tokens=%s "
+            "kv_transfer_params=%s extra_args_id=%s",
+            req_id,
+            sp.max_tokens,
+            merged,
+            id(sp.extra_args),
+        )
+        return sp
+
+    def _pop_pd_kv_params(self, req_id: str, fallback: Any | None = None) -> dict[str, Any] | None:
+        kv_params = self._normalize_kv_transfer_params(fallback)
+        with self._pd_kv_params_lock:
+            stored = self._pd_kv_params_by_req.pop(req_id, None)
+        if kv_params is None:
+            kv_params = stored
+        return kv_params
+
+    def _drop_pd_kv_params(self, req_id: str) -> None:
+        with self._pd_kv_params_lock:
+            self._pd_kv_params_by_req.pop(req_id, None)
+
+    def _extract_kv_transfer_params(self, engine_outputs: Any) -> dict[str, Any] | None:
+        """Extract kv_transfer_params from already-loaded engine outputs.
+
+        Called after engine outputs have been deserialized from IPC so that
+        shared memory is only read once.
+
+        Note: Whether MooncakeConnector propagates kv_transfer_params back
+        via EngineCoreOutput depends on the vLLM version.  Some versions
+        return ``None`` from ``request_finished()`` while others return
+        actual params (remote_host, remote_port, etc.).  When available,
+        these are merged into the decode-side kv_transfer_params.
+        """
+        outputs = engine_outputs if isinstance(engine_outputs, list) else [engine_outputs]
+        for output in outputs:
+            kv_params = getattr(output, "kv_transfer_params", None)
+            if kv_params is not None:
+                logger.debug(
+                    "[PD] Extracted kv_transfer_params from engine output: %s",
+                    kv_params,
+                )
+                return self._normalize_kv_transfer_params(kv_params)
+        return None
+
 
 class Omni(OmniBase):
     """Unified entrypoint for both LLM and Diffusion models for better usability.
@@ -908,6 +1212,26 @@ class Omni(OmniBase):
         if sampling_params_list is None:
             raise ValueError("sampling_params_list is required for pipelined generation")
 
+        # PD disaggregation: the user provides sampling params for the
+        # *logical* stages (thinker, talker, code2wav) but the PD config
+        # splits thinker into two physical stages (prefill + decode).
+        # Auto-duplicate the thinker params for the decode stage so the
+        # caller doesn't need to know about the internal split.
+        if (
+            self._pd_separation_pair is not None
+            and len(sampling_params_list) == len(self.stage_list) - 1
+        ):
+            p_id, d_id = self._pd_separation_pair
+            sp_list = list(sampling_params_list)
+            sp_list.insert(d_id, sp_list[p_id])
+            sampling_params_list = sp_list
+            logger.debug(
+                "[%s] PD mode: auto-duplicated thinker sampling params "
+                "for decode stage %d",
+                self._name,
+                d_id,
+            )
+
         if len(sampling_params_list) != len(self.stage_list):
             raise ValueError(f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}")
 
@@ -935,13 +1259,6 @@ class Omni(OmniBase):
         # Track per-request start time for end-to-end timing
         _req_start_ts: dict[str, float] = {}
         _wall_start_ts: float = time.time()
-
-        # CFG companion tracking (prompt expansion + lifecycle management)
-        cfg = CfgCompanionTracker(
-            prompt_expand_func=getattr(self.stage_list[0], "prompt_expand_func", None),
-            stage0_sampling_params=sampling_params_list[0],
-        )
-        expanded_companions = cfg.expand_prompts(request_id_to_prompt)
 
         # Determine the final stage for E2E stats (highest stage_id with final_output=True; fallback to last stage)
         final_stage_id_to_prompt: dict[str, int] = {}
@@ -973,8 +1290,21 @@ class Omni(OmniBase):
         # Mark first input time for stage-0
         metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
 
+        # Check if stage 0 is the prefill-only stage in a PD pair
+        _seed_is_prefill = (
+            self._pd_separation_pair is not None
+            and self._pd_separation_pair[0] == 0
+        )
+
         for req_id, prompt in request_id_to_prompt.items():
             sp0 = sampling_params_list[0]  # type: ignore[index]
+
+            if _seed_is_prefill:
+                # PD disaggregation: prefill-only stage generates a single
+                # token so vLLM's KV connector saves the KV cache.
+                # Aligned with vLLM's disaggregated serving proxy pattern.
+                sp0 = self._prepare_prefill_sampling_params(req_id, sp0)
+
             task = {
                 "request_id": req_id,
                 "engine_inputs": prompt,
@@ -983,18 +1313,6 @@ class Omni(OmniBase):
             self.stage_list[0].submit(task)
             _req_start_ts[req_id] = time.time()
             logger.debug(f"[{self._name}] Enqueued request {req_id} to stage-0")
-
-        # Submit CFG companion requests to stage-0
-        if cfg.is_active:
-            for companion_id, companion_prompt in expanded_companions:
-                task = {
-                    "request_id": companion_id,
-                    "engine_inputs": companion_prompt,
-                    "sampling_params": cfg.stage0_sampling_params,
-                }
-                self.stage_list[0].submit(task)
-                _req_start_ts[companion_id] = time.time()
-                logger.debug(f"[{self._name}] Enqueued CFG companion {companion_id} to stage-0")
 
         pbar = None
         if use_tqdm:
@@ -1007,7 +1325,7 @@ class Omni(OmniBase):
             )
         # For each stage, forward results to next stage; collect finals at the end
         # We pipeline by continually polling output queues in stage order
-        remaining_by_stage: list[int] = [len(request_prompts) + cfg.num_companions] + [0] * (num_stages - 1)
+        remaining_by_stage: list[int] = [len(request_prompts)] + [0] * (num_stages - 1)
         completed_requests = 0
         total_requests = len(request_prompts)
 
@@ -1024,17 +1342,11 @@ class Omni(OmniBase):
                 made_progress = True
                 req_id = result.get("request_id")
                 if "error" in result:
+                    if req_id is not None:
+                        self._drop_pd_kv_params(req_id)
                     logger.error(
                         f"[{self._name}] Stage {stage_id} error on request {req_id}: {result['error']}",
                     )
-                    if cfg.is_companion(req_id) and stage_id == 0:
-                        parent_id, parent_aborted = cfg.on_companion_error(req_id)
-                        if parent_aborted:
-                            completed_requests += 1
-                            logger.error(
-                                f"[{self._name}] Parent {parent_id} aborted due to "
-                                f"companion failure ({completed_requests}/{total_requests})",
-                            )
                     continue
 
                 if result.get("type") == "stage_ready":
@@ -1043,31 +1355,19 @@ class Omni(OmniBase):
                     time.sleep(0.05)
                     continue
 
-                # CFG: companion requests only run through Stage-0
-                if cfg.is_companion(req_id) and stage_id == 0:
-                    ready_parent = cfg.on_companion_completed(req_id)
-                    if ready_parent is not None:
-                        success = cfg.forward_parent_with_cfg(
-                            ready_parent,
-                            cfg.pop_pending_parent(ready_parent),
-                            self.stage_list,
-                            self.connectors,
-                            sampling_params_list,
-                            request_id_to_prompt,
-                            final_stage_id_to_prompt,
-                            metrics,
-                            remaining_by_stage,
-                        )
-                        if not success:
-                            cfg.consume_parent_failure(ready_parent)
-                            completed_requests += 1
-                            logger.error(
-                                f"[{self._name}] Parent {ready_parent} dropped due to CFG forwarding failure "
-                                f"({completed_requests}/{total_requests})",
-                            )
-                    continue
-
                 engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
+
+                # PD: extract kv_transfer_params from prefill engine outputs
+                # (must happen after _load so shared memory is read only once).
+                if (
+                    self._pd_separation_pair is not None
+                    and req_id is not None
+                    and stage_id == self._pd_separation_pair[0]
+                ):
+                    kv_params = self._extract_kv_transfer_params(engine_outputs)
+                    if kv_params is not None:
+                        with self._pd_kv_params_lock:
+                            self._pd_kv_params_by_req[req_id] = kv_params
                 # Mark last output time for this stage whenever we receive outputs
                 metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
                 try:
@@ -1156,55 +1456,107 @@ class Omni(OmniBase):
 
                 next_stage_id = stage_id + 1
                 if next_stage_id <= final_stage_id_to_prompt[req_id]:
-                    # CFG: if this parent has companions, defer forwarding
-                    if cfg.has_companions(req_id) and stage_id == 0:
-                        if cfg.is_parent_failed(req_id):
-                            cfg.consume_parent_failure(req_id)
-                            completed_requests += 1
-                            logger.error(
-                                f"[{self._name}] Parent {req_id} skipped CFG forwarding due to "
-                                f"companion failure ({completed_requests}/{total_requests})",
+                    next_stage: OmniStage = self.stage_list[next_stage_id]
+
+                    # PD disaggregation: when routing from prefill to decode,
+                    # re-submit the original prompt so the decode engine can
+                    # load the prefilled KV cache via vLLM's native connector.
+                    is_pd_routing = (
+                        self._pd_separation_pair is not None
+                        and self._pd_separation_pair == (stage_id, next_stage_id)
+                    )
+
+                    if is_pd_routing:
+                        # Use the original prompt as decode engine input
+                        original_prompt = request_id_to_prompt[req_id]
+                        next_inputs = [original_prompt] if not isinstance(original_prompt, list) else original_prompt
+
+                        sp_next = sampling_params_list[next_stage_id]  # type: ignore[index]
+                        sp_next = sp_next.clone()
+                        if sp_next.extra_args is None:
+                            sp_next.extra_args = {}
+
+                        # Build decode-side kv_transfer_params.  The decode
+                        # engine needs ``do_remote_prefill=True`` so the KV
+                        # connector loads the remotely prefilled KV cache.
+                        decode_kv_params: dict[str, Any] = {
+                            "do_remote_decode": False,
+                            "do_remote_prefill": True,
+                            "transfer_id": f"xfer-{req_id}",
+                        }
+
+                        # Merge any user-provided kv_transfer_params first
+                        existing_kv_params = self._normalize_kv_transfer_params(
+                            sp_next.extra_args.get("kv_transfer_params")
+                        )
+                        if existing_kv_params:
+                            decode_kv_params.update(existing_kv_params)
+
+                        # Add prefill engine connection info from config (if missing)
+                        if self._pd_connector_info:
+                            eid = self._pd_connector_info.get("prefill_engine_id")
+                            if eid is not None and "remote_engine_id" not in decode_kv_params:
+                                decode_kv_params["remote_engine_id"] = eid
+                            baddr = self._pd_connector_info.get("prefill_bootstrap_addr")
+                            if baddr is not None and "remote_bootstrap_addr" not in decode_kv_params:
+                                decode_kv_params["remote_bootstrap_addr"] = baddr
+
+                        # If the prefill output carried connector metadata,
+                        # merge it in (some connectors return additional info).
+                        kv_params_from_output = self._pop_pd_kv_params(
+                            req_id, result.get("kv_transfer_params")
+                        )
+                        if kv_params_from_output:
+                            decode_kv_params.update(kv_params_from_output)
+
+                        # Ensure the decode role flags are correct
+                        decode_kv_params["do_remote_prefill"] = True
+                        decode_kv_params["do_remote_decode"] = False
+                        if not decode_kv_params.get("transfer_id"):
+                            decode_kv_params["transfer_id"] = f"xfer-{req_id}"
+
+                        sp_next.extra_args["kv_transfer_params"] = decode_kv_params
+                        logger.info(
+                            "[%s] PD routing: stage-%d→stage-%d, req %s, "
+                            "remote_request_id=%s, remote=%s:%s",
+                            self._name,
+                            stage_id,
+                            next_stage_id,
+                            req_id,
+                            decode_kv_params.get("remote_request_id", "NOT SET"),
+                            decode_kv_params.get("remote_host", "?"),
+                            decode_kv_params.get("remote_port", "?"),
+                        )
+                        if "remote_request_id" not in decode_kv_params:
+                            logger.warning(
+                                "[%s] PD routing: remote_request_id NOT SET "
+                                "in decode_kv_params for req %s. Apply the "
+                                "mooncake_connector.py patch to fix this.",
+                                self._name,
+                                req_id,
+                            )
+                    else:
+                        try:
+                            # Derive inputs for the next stage, record preprocess time
+                            with metrics.stage_postprocess_timer(stage_id, req_id):
+                                next_inputs = next_stage.process_engine_inputs(
+                                    self.stage_list, [request_id_to_prompt[req_id]]
+                                )
+                        except Exception as e:
+                            logger.exception(
+                                f"[{self._name}] Process engine inputs error for req {req_id}"
+                                f" at stage {next_stage_id}: {e}",
                             )
                             continue
+                        sp_next = sampling_params_list[next_stage_id]  # type: ignore[index]
 
-                        if cfg.all_companions_done(req_id):
-                            success = cfg.forward_parent_with_cfg(
-                                req_id,
-                                {"engine_outputs": engine_outputs, "stage_id": stage_id},
-                                self.stage_list,
-                                self.connectors,
-                                sampling_params_list,
-                                request_id_to_prompt,
-                                final_stage_id_to_prompt,
-                                metrics,
-                                remaining_by_stage,
-                            )
-                            if not success:
-                                cfg.consume_parent_failure(req_id)
-                                completed_requests += 1
-                                logger.error(
-                                    f"[{self._name}] Parent {req_id} dropped due to CFG forwarding failure "
-                                    f"({completed_requests}/{total_requests})",
-                                )
-                        else:
-                            cfg.defer_parent(req_id, engine_outputs, stage_id)
-                        continue
-
-                    next_stage: OmniStage = self.stage_list[next_stage_id]
-                    try:
-                        # Derive inputs for the next stage, record preprocess time
-                        with metrics.stage_postprocess_timer(stage_id, req_id):
-                            next_inputs = next_stage.process_engine_inputs(
-                                self.stage_list, [request_id_to_prompt[req_id]]
-                            )
-                    except Exception as e:
-                        completed_requests += 1
-                        logger.exception(
-                            f"[{self._name}] Process engine inputs error for req {req_id}"
-                            f" at stage {next_stage_id}: {e} ({completed_requests}/{total_requests})",
-                        )
-                        continue
-                    sp_next = sampling_params_list[next_stage_id]  # type: ignore[index]
+                    # If we are about to enter the prefill stage (when it is not stage-0),
+                    # apply prefill-only sampling params.
+                    if (
+                        self._pd_separation_pair is not None
+                        and next_stage_id == self._pd_separation_pair[0]
+                    ):
+                        sp_next = self._prepare_prefill_sampling_params(req_id, sp_next)
 
                     # Check if we have a connector for this edge
                     connector_key = (str(stage_id), str(next_stage_id))
@@ -1228,13 +1580,14 @@ class Omni(OmniBase):
                             f"[{self._name}] Failed to send request {req_id} to stage-{next_stage_id} via connector. "
                             "Configure a connector for this edge or inspect connector logs for details."
                         )
-
                     logger.debug(
                         f"[{self._name}] Forwarded request {req_id} to stage-{next_stage_id}",
                     )
                     remaining_by_stage[next_stage_id] += 1
                 else:
                     completed_requests += 1
+                    if req_id is not None:
+                        self._drop_pd_kv_params(req_id)
                     if pbar:
                         final_mod = self.output_modalities[final_stage_id_to_prompt[req_id]]
                         pbar.unit = "img" if final_mod == "image" else "req"
@@ -1242,12 +1595,6 @@ class Omni(OmniBase):
                     logger.debug(
                         f"[{self._name}] Request {req_id} fully completed ({completed_requests}/{total_requests})",
                     )
-            for timed_out_id in cfg.check_timeouts():
-                completed_requests += 1
-                logger.error(
-                    f"[{self._name}] Parent {timed_out_id} timed out; counting as failed "
-                    f"({completed_requests}/{total_requests})",
-                )
 
             if not made_progress:
                 time.sleep(0.005)
@@ -1255,6 +1602,11 @@ class Omni(OmniBase):
 
         if pbar:
             pbar.close()
+
+        # Defense-in-depth: drop any leftover PD KV params for this batch
+        # in case error/completion paths missed a cleanup.
+        for rid in request_ids:
+            self._drop_pd_kv_params(rid)
 
         # Summarize and print stats
         try:
