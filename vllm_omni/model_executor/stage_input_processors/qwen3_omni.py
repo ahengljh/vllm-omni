@@ -3,6 +3,7 @@
 # Copyright 2025 The Qwen team.
 """Stage input processor for Qwen3 Omni MoE: Thinker → Talker transition."""
 
+import logging
 from typing import Any
 
 import torch
@@ -11,6 +12,16 @@ from vllm.platforms import current_platform
 
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
+
+logger = logging.getLogger(__name__)
+
+# Pooling output layer keys used by the thinker → talker transition.
+# "0" is always the word embedding layer.  "24" corresponds to the talker's
+# ``accept_hidden_layer`` config (``TalkerConfig.accept_hidden_layer``).
+# If the model config changes this value, update _HIDDEN_LAYER_KEY accordingly
+# or derive it dynamically from the stage config at initialisation time.
+_EMBED_LAYER_KEY = "0"
+_HIDDEN_LAYER_KEY = "24"
 
 
 def _compute_talker_prompt_ids_length(info, device: torch.device | str = "cuda") -> int:
@@ -105,8 +116,8 @@ def thinker2talker_async_chunk(
         all_token_ids = _ensure_list(all_token_ids)
         prompt_token_ids = _ensure_list(prompt_token_ids)
         talker_additional_info = {
-            "thinker_embeddings": pooling_output.get("0").detach().cpu(),
-            "thinker_hidden_states": pooling_output.get("24").detach().cpu(),
+            "thinker_embeddings": pooling_output.get(_EMBED_LAYER_KEY).detach().cpu(),
+            "thinker_hidden_states": pooling_output.get(_HIDDEN_LAYER_KEY).detach().cpu(),
             "thinker_sequences": all_token_ids,
             "thinker_input_ids": prompt_token_ids,
             # Provide thinker-side TTS token embeddings for talker projection
@@ -134,14 +145,83 @@ def thinker2talker_async_chunk(
         output_token_ids = _ensure_list(output_token_ids)
 
         talker_additional_info = {
-            "thinker_embeddings": pooling_output.get("0").detach().cpu(),
+            "thinker_embeddings": pooling_output.get(_EMBED_LAYER_KEY).detach().cpu(),
+            "thinker_hidden_states": pooling_output.get(_HIDDEN_LAYER_KEY).detach().cpu(),
+            "thinker_sequences": output_token_ids,
             "finished": torch.tensor(is_finished, dtype=torch.bool),
         }
 
         if not output_token_ids:
             # When prefilling a chunked thinker, thinker_hidden_states needs to be updated.
-            talker_additional_info["thinker_hidden_states"] = pooling_output.get("24").detach().cpu()
+            talker_additional_info["thinker_hidden_states"] = pooling_output.get(_HIDDEN_LAYER_KEY).detach().cpu()
     return talker_additional_info
+
+
+def _get_prefill_stage(stage_list: list[Any], source_stage_id: int) -> Any | None:
+    """Return the preceding prefill stage if PD disaggregation is active."""
+    if source_stage_id <= 0:
+        return None
+    source_stage = stage_list[source_stage_id]
+    if not getattr(source_stage, "is_decode_only", False):
+        return None
+    prev_stage = stage_list[source_stage_id - 1]
+    if (
+        getattr(prev_stage, "is_prefill_only", False)
+        and prev_stage.engine_outputs is not None
+    ):
+        return prev_stage
+    return None
+
+
+def _merge_pd_embeddings(
+    decode_emb: torch.Tensor,
+    decode_hid: torch.Tensor,
+    prefill_mm: dict[str, Any],
+    device: torch.device,
+    expected_total: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Merge prefill prompt embeddings with decode generated embeddings.
+
+    In PD disaggregation the decode engine only produces embeddings for the
+    tokens it actually computed.  The prefill engine has embeddings for the
+    full prompt.  We concatenate them, dynamically computing any overlap::
+
+        overlap = prefill_len + decode_len - expected_total
+        merged  = prefill + decode[overlap:]
+
+    When ``expected_total`` (= len(prompt_token_ids) + len(output.token_ids))
+    is provided we use it to decide how many leading decode embeddings to
+    skip (they duplicate trailing prefill positions).  If not provided we
+    fall back to no-skip concatenation.
+    """
+    try:
+        p_emb = prefill_mm[_EMBED_LAYER_KEY].detach().to(device=device, dtype=torch.float)
+        p_hid = prefill_mm[_HIDDEN_LAYER_KEY].detach().to(device=device, dtype=torch.float)
+    except (KeyError, AttributeError, TypeError):
+        return decode_emb, decode_hid
+
+    if p_emb.shape[0] == 0 or decode_emb.shape[0] == 0:
+        return decode_emb, decode_hid
+
+    raw_total = p_emb.shape[0] + decode_emb.shape[0]
+    if expected_total is not None and raw_total > expected_total:
+        overlap = raw_total - expected_total
+    else:
+        overlap = 0
+
+    merged_emb = torch.cat([p_emb, decode_emb[overlap:]], dim=0)
+    merged_hid = torch.cat([p_hid, decode_hid[overlap:]], dim=0)
+
+    logger.debug(
+        "[PD] Merged prefill(%d) + decode(%d) overlap=%d → %d embeddings "
+        "(expected=%s)",
+        p_emb.shape[0],
+        decode_emb.shape[0],
+        overlap,
+        merged_emb.shape[0],
+        expected_total,
+    )
+    return merged_emb, merged_hid
 
 
 def thinker2talker(
@@ -158,6 +238,12 @@ def thinker2talker(
     2. Split hidden states into: prompt embeddings + generated embeddings
     3. Package for talker with additional information
 
+    In PD disaggregation the decode engine's multimodal_output only covers
+    the tokens it computed (not the full prompt).  When a preceding prefill
+    stage is detected we merge the prefill's prompt embeddings with the
+    decode's generated embeddings so the talker receives the complete
+    sequence.
+
     Args:
         stage_list: List of stage objects
         engine_input_source: Source stage IDs (typically [0] for thinker)
@@ -172,21 +258,69 @@ def thinker2talker(
 
     device = torch.device(current_platform.device_type)
 
+    # PD disaggregation: look for a preceding prefill stage whose
+    # embeddings we need to merge with the decode output.
+    source_stage_id = engine_input_source[0]
+    prefill_stage = _get_prefill_stage(stage_list, source_stage_id)
+
     # Process each thinker output
-    for thinker_output in thinker_outputs:
+    for i, thinker_output in enumerate(thinker_outputs):
         output = thinker_output.outputs[0]
 
+        decode_emb = output.multimodal_output[_EMBED_LAYER_KEY].detach().to(device=device, dtype=torch.float)
+        decode_hid = output.multimodal_output[_HIDDEN_LAYER_KEY].detach().to(device=device, dtype=torch.float)
+
+        # Expected total = prompt tokens + generated tokens (the full sequence).
+        expected_total = len(thinker_output.prompt_token_ids) + len(output.token_ids)
+
+        logger.debug(
+            "[PD] thinker2talker: prompt_len=%d, output_len=%d, "
+            "expected_total=%d, decode_emb=%d, decode_hid=%d",
+            len(thinker_output.prompt_token_ids),
+            len(output.token_ids),
+            expected_total,
+            decode_emb.shape[0],
+            decode_hid.shape[0],
+        )
+
+        # Merge prefill prompt embeddings when running in PD mode.
+        if prefill_stage is not None:
+            try:
+                prefill_eos = prefill_stage.engine_outputs
+                prefill_eo = prefill_eos[min(i, len(prefill_eos) - 1)]
+                prefill_mm = prefill_eo.outputs[0].multimodal_output
+                decode_emb, decode_hid = _merge_pd_embeddings(
+                    decode_emb, decode_hid, prefill_mm, device,
+                    expected_total=expected_total,
+                )
+            except Exception as exc:
+                logger.warning("[PD] Could not merge prefill embeddings: %s", exc)
+
+        # Helper: get TTS embed from decode, fall back to prefill if missing.
+        def _tts(key: str) -> torch.Tensor:
+            val = output.multimodal_output.get(key)
+            if val is None and prefill_stage is not None:
+                try:
+                    val = (
+                        prefill_stage.engine_outputs[0]
+                        .outputs[0]
+                        .multimodal_output.get(key)
+                    )
+                except Exception:
+                    pass
+            return val.detach().to(device=device, dtype=torch.float) if val is not None else None
+
         info = {
-            "thinker_embeddings": output.multimodal_output["0"].detach().to(device=device, dtype=torch.float),
-            "thinker_hidden_states": output.multimodal_output["24"].detach().to(device=device, dtype=torch.float),
+            "thinker_embeddings": decode_emb,
+            "thinker_hidden_states": decode_hid,
             "thinker_sequences": (
                 thinker_output.prompt_token_ids + output.token_ids
             ),  # the thinker_sequences is the whole ids
             "thinker_input_ids": thinker_output.prompt_token_ids,
             # Provide thinker-side TTS token embeddings for talker projection
-            "tts_bos_embed": output.multimodal_output["tts_bos_embed"].detach().to(device=device, dtype=torch.float),
-            "tts_eos_embed": output.multimodal_output["tts_eos_embed"].detach().to(device=device, dtype=torch.float),
-            "tts_pad_embed": output.multimodal_output["tts_pad_embed"].detach().to(device=device, dtype=torch.float),
+            "tts_bos_embed": _tts("tts_bos_embed"),
+            "tts_eos_embed": _tts("tts_eos_embed"),
+            "tts_pad_embed": _tts("tts_pad_embed"),
         }
 
         prompt_len = _compute_talker_prompt_ids_length(info, device=device)

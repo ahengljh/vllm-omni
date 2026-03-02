@@ -779,10 +779,54 @@ class Qwen3OmniMoeForConditionalGeneration(
         Returns:
             (input_ids, input_embeds) for talker
         """
+        # Pad thinker_embed / thinker_hidden to match thinker_result_ids length
+        # so that all downstream slices use consistent indices.  The mismatch
+        # can happen when the thinker sequence includes generated tokens that
+        # don't have corresponding embeddings (e.g. in PD disaggregation).
+        #
+        # Safety note: Zero-padded positions are safe because the talker's
+        # ChatML-segment loop (below) only slices embeddings within
+        # im_start_index boundaries.  The padded tail falls outside the last
+        # assistant segment and is never attended to.  Additionally, the
+        # multimodal_mask only selects audio/image/video token positions,
+        # which always lie within the prompt (prefill) portion where real
+        # embeddings exist.
+        target_len = thinker_result_ids.shape[-1]
+        _PD_PAD_THRESHOLD = 512
+        if thinker_embed.shape[0] < target_len:
+            pad_len = target_len - thinker_embed.shape[0]
+            if pad_len > _PD_PAD_THRESHOLD:
+                logger.warning(
+                    "[PD] Unexpectedly large embed padding: %d tokens "
+                    "(threshold=%d). This may indicate a bug in PD "
+                    "disaggregation.",
+                    pad_len,
+                    _PD_PAD_THRESHOLD,
+                )
+            thinker_embed = torch.cat(
+                (thinker_embed, torch.zeros(pad_len, thinker_embed.shape[1],
+                                            device=thinker_embed.device, dtype=thinker_embed.dtype)),
+                dim=0,
+            )
+        if thinker_hidden.shape[0] < target_len:
+            pad_len = target_len - thinker_hidden.shape[0]
+            if pad_len > _PD_PAD_THRESHOLD:
+                logger.warning(
+                    "[PD] Unexpectedly large hidden padding: %d tokens "
+                    "(threshold=%d). This may indicate a bug in PD "
+                    "disaggregation.",
+                    pad_len,
+                    _PD_PAD_THRESHOLD,
+                )
+            thinker_hidden = torch.cat(
+                (thinker_hidden, torch.zeros(pad_len, thinker_hidden.shape[1],
+                                             device=thinker_hidden.device, dtype=thinker_hidden.dtype)),
+                dim=0,
+            )
         im_start_indexes = torch.cat(
             (
                 torch.nonzero(input_ids[0] == self.config.im_start_token_id).squeeze(),
-                torch.tensor([thinker_result_ids.shape[-1]], device=input_ids.device, dtype=input_ids.dtype),
+                torch.tensor([target_len], device=input_ids.device, dtype=input_ids.dtype),
             ),
             dim=-1,
         )  # Shape [n_starts + 1]; Take batch 0 since batched inference is not supported here.
@@ -903,8 +947,25 @@ class Qwen3OmniMoeForConditionalGeneration(
         return last_talker_hidden, text_step, update_dict
 
     def _get_talker_user_parts(self, im_start_index, segment_end_index, multimodal_mask, thinker_hidden, thinker_embed):
+        # Clamp segment_end_index to the shortest tensor so mask and embed
+        # slices always have the same length (guards against length mismatches
+        # between thinker_result_ids, thinker_embed, and thinker_hidden).
+        segment_end_index = min(
+            segment_end_index,
+            multimodal_mask.shape[0],
+            thinker_hidden.shape[0],
+            thinker_embed.shape[0],
+        )
+        seg_len = segment_end_index - im_start_index
+        if seg_len <= 0:
+            return torch.empty(
+                (0, self.config.talker_config.text_config.hidden_size),
+                device=thinker_hidden.device,
+                dtype=torch.bfloat16,
+            )
+
         user_talker_part = torch.empty(
-            (segment_end_index - im_start_index, self.config.talker_config.text_config.hidden_size),
+            (seg_len, self.config.talker_config.text_config.hidden_size),
             device=thinker_hidden.device,
             dtype=torch.bfloat16,
         )
