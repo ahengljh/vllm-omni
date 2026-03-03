@@ -37,19 +37,17 @@ def apply_mooncake_connector_patch(engine_id: str | None = None) -> bool:
     """
     global _patched
     if _patched:
-        logger.debug(
-            "[monkey_patch] MooncakeConnector patch already applied, skipping"
-        )
+        logger.debug("[monkey_patch] MooncakeConnector patch already applied, skipping")
         return True
 
     # --- 0. Version compatibility check ----------------------------------
     _VLLM_MIN_VERSION = "0.8.0"
     try:
         import vllm
+
         if hasattr(vllm, "__version__") and vllm.__version__ < _VLLM_MIN_VERSION:
             logger.warning(
-                "[monkey_patch] vLLM %s < %s — MooncakeConnector patch "
-                "may be incompatible",
+                "[monkey_patch] vLLM %s < %s — MooncakeConnector patch may be incompatible",
                 vllm.__version__,
                 _VLLM_MIN_VERSION,
             )
@@ -61,11 +59,11 @@ def apply_mooncake_connector_patch(engine_id: str | None = None) -> bool:
         from vllm.distributed.kv_transfer.kv_connector.v1 import (
             mooncake_connector as _mc_module,
         )
+
         _OriginalMooncakeConnector = _mc_module.MooncakeConnector
     except (ImportError, AttributeError) as exc:
         logger.warning(
-            "[monkey_patch] Cannot import vLLM MooncakeConnector — "
-            "patch NOT applied: %s",
+            "[monkey_patch] Cannot import vLLM MooncakeConnector — patch NOT applied: %s",
             exc,
         )
         return False
@@ -90,10 +88,7 @@ def apply_mooncake_connector_patch(engine_id: str | None = None) -> bool:
     for module_name, module in sys.modules.items():
         if "vllm" not in module_name:
             continue
-        if (
-            hasattr(module, "MooncakeConnector")
-            and module.MooncakeConnector is _OriginalMooncakeConnector
-        ):
+        if hasattr(module, "MooncakeConnector") and module.MooncakeConnector is _OriginalMooncakeConnector:
             module.MooncakeConnector = PatchedClass
             logger.debug(
                 "[monkey_patch] Also patched MooncakeConnector in %s",

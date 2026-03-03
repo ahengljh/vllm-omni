@@ -842,8 +842,12 @@ class Qwen3OmniMoeForConditionalGeneration(
                     _PD_PAD_THRESHOLD,
                 )
             thinker_embed = torch.cat(
-                (thinker_embed, torch.zeros(pad_len, thinker_embed.shape[1],
-                                            device=thinker_embed.device, dtype=thinker_embed.dtype)),
+                (
+                    thinker_embed,
+                    torch.zeros(
+                        pad_len, thinker_embed.shape[1], device=thinker_embed.device, dtype=thinker_embed.dtype
+                    ),
+                ),
                 dim=0,
             )
         if thinker_hidden.shape[0] < target_len:
@@ -857,8 +861,12 @@ class Qwen3OmniMoeForConditionalGeneration(
                     _PD_PAD_THRESHOLD,
                 )
             thinker_hidden = torch.cat(
-                (thinker_hidden, torch.zeros(pad_len, thinker_hidden.shape[1],
-                                             device=thinker_hidden.device, dtype=thinker_hidden.dtype)),
+                (
+                    thinker_hidden,
+                    torch.zeros(
+                        pad_len, thinker_hidden.shape[1], device=thinker_hidden.device, dtype=thinker_hidden.dtype
+                    ),
+                ),
                 dim=0,
             )
         im_start_indexes = torch.cat(

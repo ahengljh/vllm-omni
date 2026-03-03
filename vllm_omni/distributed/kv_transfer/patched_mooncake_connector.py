@@ -28,11 +28,13 @@ if TYPE_CHECKING:
 # Patched metadata dataclass
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class PatchedRecvReqMeta:
     """Extended receive-request metadata that carries the prefill engine's
     internal request ID (``remote_request_id``) alongside the local one.
     """
+
     request_id: str
     remote_request_id: str
     local_block_ids: list[int]
@@ -42,6 +44,7 @@ class PatchedRecvReqMeta:
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
+
 
 def create_patched_mooncake_connector(engine_id: str | None = None):
     """Return a *subclass* of vLLM's ``MooncakeConnector`` with
@@ -131,8 +134,7 @@ def create_patched_mooncake_connector(engine_id: str | None = None):
                 if hasattr(self, "side_channel_port"):
                     result.setdefault("remote_port", self.side_channel_port)
                 logger.debug(
-                    "[PatchedMooncakeConnector] request_finished: "
-                    "req_id=%s remote_request_id=%s engine_id=%s",
+                    "[PatchedMooncakeConnector] request_finished: req_id=%s remote_request_id=%s engine_id=%s",
                     req_id,
                     result.get("remote_request_id"),
                     self.engine_id,
@@ -172,9 +174,7 @@ def create_patched_mooncake_connector(engine_id: str | None = None):
             )
 
             if load_remote_cache:
-                remote_request_id = kv_transfer_params.get(
-                    "remote_request_id", request_id
-                )
+                remote_request_id = kv_transfer_params.get("remote_request_id", request_id)
                 meta = PatchedRecvReqMeta(
                     request_id=request_id,
                     remote_request_id=remote_request_id,
@@ -187,8 +187,7 @@ def create_patched_mooncake_connector(engine_id: str | None = None):
                     self._reqs_need_recv = {}
                 self._reqs_need_recv[request_id] = meta
                 logger.debug(
-                    "[PatchedMooncakeConnector] add_new_req (recv): "
-                    "local_id=%s remote_id=%s engine_id=%s",
+                    "[PatchedMooncakeConnector] add_new_req (recv): local_id=%s remote_id=%s engine_id=%s",
                     request_id,
                     remote_request_id,
                     self.engine_id,
@@ -217,8 +216,7 @@ def create_patched_mooncake_connector(engine_id: str | None = None):
                     remote_id = meta.remote_request_id
                     self.remote_to_local_req[remote_id] = local_id
                     logger.debug(
-                        "[PatchedMooncakeConnector] group_kv_pull: "
-                        "remote_id=%s -> local_id=%s",
+                        "[PatchedMooncakeConnector] group_kv_pull: remote_id=%s -> local_id=%s",
                         remote_id,
                         local_id,
                     )
@@ -261,8 +259,7 @@ def create_patched_mooncake_connector(engine_id: str | None = None):
                 for remote_id in completed:
                     popped_local = self.remote_to_local_req.pop(remote_id, None)
                     logger.debug(
-                        "[PatchedMooncakeConnector] receive_kv done: "
-                        "remote_id=%s -> local_id=%s",
+                        "[PatchedMooncakeConnector] receive_kv done: remote_id=%s -> local_id=%s",
                         remote_id,
                         popped_local,
                     )

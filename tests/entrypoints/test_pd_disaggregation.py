@@ -29,6 +29,7 @@ warnings.filterwarnings(
 # Fake helpers (same pattern as test_omni_llm.py)
 # ---------------------------------------------------------------------------
 
+
 class _FakeEngineArgs(dict):
     """Fake engine args that supports both attribute and dict access."""
 
@@ -108,7 +109,9 @@ class _FakeStage:
         self._in_q = in_q
         self._out_q = out_q
 
-    def init_stage_worker(self, model: str, *, is_async=False, shm_threshold_bytes=65536, ctx=None, batch_timeout=10, **kwargs):
+    def init_stage_worker(
+        self, model: str, *, is_async=False, shm_threshold_bytes=65536, ctx=None, batch_timeout=10, **kwargs
+    ):
         self._proc = MagicMock()
         self._proc.start = MagicMock()
         self._proc.join = MagicMock()
@@ -149,6 +152,7 @@ class _FakeStage:
 # ---------------------------------------------------------------------------
 # Shared mock setup helpers
 # ---------------------------------------------------------------------------
+
 
 def _setup_engine_mocks(monkeypatch):
     fake_engine = MagicMock()
@@ -265,9 +269,11 @@ def _setup_log_mocks(monkeypatch):
 
         def stage_postprocess_timer(self, stage_id, req_id):
             from contextlib import contextmanager
+
             @contextmanager
             def _noop():
                 yield
+
             return _noop()
 
         def build_and_log_summary(self):
@@ -282,6 +288,7 @@ def _setup_log_mocks(monkeypatch):
 
 def _clear_modules():
     import sys
+
     for module_name in [
         "vllm_omni.entrypoints.utils",
         "vllm_omni.entrypoints.omni",
@@ -318,14 +325,26 @@ def mock_get_config(monkeypatch):
                 return len(prompt_token_ids)
         return 10
 
-    monkeypatch.setattr("vllm.utils.length_from_prompt_token_ids_or_embeds", _mock_length_from_prompt_token_ids_or_embeds, raising=False)
-    monkeypatch.setattr("vllm_omni.engine.input_processor.length_from_prompt_token_ids_or_embeds", _mock_length_from_prompt_token_ids_or_embeds, raising=False)
+    monkeypatch.setattr(
+        "vllm.utils.length_from_prompt_token_ids_or_embeds", _mock_length_from_prompt_token_ids_or_embeds, raising=False
+    )
+    monkeypatch.setattr(
+        "vllm_omni.engine.input_processor.length_from_prompt_token_ids_or_embeds",
+        _mock_length_from_prompt_token_ids_or_embeds,
+        raising=False,
+    )
 
     processor_module_path = "vllm_omni.engine.input_processor"
     if processor_module_path in sys.modules:
-        setattr(sys.modules[processor_module_path], "length_from_prompt_token_ids_or_embeds", _mock_length_from_prompt_token_ids_or_embeds)
+        setattr(
+            sys.modules[processor_module_path],
+            "length_from_prompt_token_ids_or_embeds",
+            _mock_length_from_prompt_token_ids_or_embeds,
+        )
 
-    monkeypatch.setattr("vllm_omni.entrypoints.async_omni.init_tokenizer_from_configs", _mock_init_tokenizer_from_configs, raising=False)
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.async_omni.init_tokenizer_from_configs", _mock_init_tokenizer_from_configs, raising=False
+    )
     async_omni_path = "vllm_omni.entrypoints.async_omni"
     if async_omni_path in sys.modules:
         setattr(sys.modules[async_omni_path], "init_tokenizer_from_configs", _mock_init_tokenizer_from_configs)
@@ -333,12 +352,15 @@ def mock_get_config(monkeypatch):
     fake_hf_config = MagicMock()
     fake_hf_config.model_type = "qwen2_5_omni"
 
-    monkeypatch.setattr("vllm.transformers_utils.config.get_config", lambda model, **kwargs: fake_hf_config, raising=False)
+    monkeypatch.setattr(
+        "vllm.transformers_utils.config.get_config", lambda model, **kwargs: fake_hf_config, raising=False
+    )
     monkeypatch.setattr("vllm_omni.entrypoints.utils.get_config", lambda model, **kwargs: fake_hf_config, raising=False)
 
     def _mock_cached_file(path_or_repo_id, *args, **kwargs):
         import os
         import tempfile
+
         fake_config_file = os.path.join(tempfile.gettempdir(), "fake_config.json")
         if not os.path.exists(fake_config_file):
             with open(fake_config_file, "w") as f:
@@ -358,6 +380,7 @@ def mock_get_config(monkeypatch):
 # ---------------------------------------------------------------------------
 # Helper to build an Omni instance with PD stage configs
 # ---------------------------------------------------------------------------
+
 
 def _make_pd_omni(monkeypatch, stage_configs, *, extra_setup=None):
     """Create an Omni instance whose stage_list consists of _FakeStage objects
@@ -411,16 +434,25 @@ def _make_pd_omni(monkeypatch, stage_configs, *, extra_setup=None):
 
     # Mock initialize_orchestrator_connectors so it doesn't parse real configs
     monkeypatch.setattr(
-        omni_module, "initialize_orchestrator_connectors",
+        omni_module,
+        "initialize_orchestrator_connectors",
         lambda *args, **kwargs: (None, fake_connectors),
     )
 
     # Mock try_send_via_connector to directly submit to the stage queue
     # (the real version uses OmniConnector IPC; in tests we just put the
     # payload into the stage's input queue directly).
-    def _fake_try_send(connector, stage_id, next_stage_id, req_id,
-                       next_inputs, sampling_params, original_prompt,
-                       next_stage_queue_submit_fn, metrics):
+    def _fake_try_send(
+        connector,
+        stage_id,
+        next_stage_id,
+        req_id,
+        next_inputs,
+        sampling_params,
+        original_prompt,
+        next_stage_queue_submit_fn,
+        metrics,
+    ):
         task = {
             "request_id": req_id,
             "engine_inputs": next_inputs,
@@ -442,6 +474,7 @@ def _make_pd_omni(monkeypatch, stage_configs, *, extra_setup=None):
             stage.attach_queues(in_q, out_q)
 
     from vllm_omni.entrypoints.omni import OmniBase
+
     monkeypatch.setattr(OmniBase, "_start_stages", _fake_start_stages)
     monkeypatch.setattr(OmniBase, "_wait_for_stages_ready", lambda self, timeout=120: None)
 
@@ -449,12 +482,14 @@ def _make_pd_omni(monkeypatch, stage_configs, *, extra_setup=None):
         extra_setup(monkeypatch, omni_module)
 
     from vllm_omni.entrypoints.omni import Omni
+
     return Omni(model="any", init_timeout=1)
 
 
 # ---------------------------------------------------------------------------
 # Stage config templates
 # ---------------------------------------------------------------------------
+
 
 def _prefill_stage_cfg(stage_id=0, **overrides):
     cfg = {
@@ -529,39 +564,63 @@ def _code2wav_stage_cfg(stage_id=3, engine_input_source=None, **overrides):
 # Tests: PD pair detection
 # ===================================================================
 
+
 class TestDetectPDSeparation:
     """Tests for Omni._detect_pd_separation()."""
 
     def test_detects_pd_pair(self, monkeypatch):
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(stage_id=0),
-            _decode_stage_cfg(stage_id=1, engine_input_source=[0]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(stage_id=0),
+                _decode_stage_cfg(stage_id=1, engine_input_source=[0]),
+            ],
+        )
         assert omni._pd_separation_pair == (0, 1)
 
     def test_no_pd_pair_without_flags(self, monkeypatch):
         """Normal (non-PD) pipeline has no PD pair."""
-        omni = _make_pd_omni(monkeypatch, [
-            {"stage_id": 0, "engine_args": {"model_stage": "thinker"}, "final_output": True, "final_output_type": "text"},
-            {"stage_id": 1, "engine_args": {"model_stage": "talker"}, "engine_input_source": [0], "final_output": True, "final_output_type": "audio"},
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                {
+                    "stage_id": 0,
+                    "engine_args": {"model_stage": "thinker"},
+                    "final_output": True,
+                    "final_output_type": "text",
+                },
+                {
+                    "stage_id": 1,
+                    "engine_args": {"model_stage": "talker"},
+                    "engine_input_source": [0],
+                    "final_output": True,
+                    "final_output_type": "audio",
+                },
+            ],
+        )
         assert omni._pd_separation_pair is None
 
     def test_detects_pd_pair_in_4_stage_pipeline(self, monkeypatch):
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(stage_id=0),
-            _decode_stage_cfg(stage_id=1, engine_input_source=[0]),
-            _talker_stage_cfg(stage_id=2, engine_input_source=[1]),
-            _code2wav_stage_cfg(stage_id=3, engine_input_source=[2]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(stage_id=0),
+                _decode_stage_cfg(stage_id=1, engine_input_source=[0]),
+                _talker_stage_cfg(stage_id=2, engine_input_source=[1]),
+                _code2wav_stage_cfg(stage_id=3, engine_input_source=[2]),
+            ],
+        )
         assert omni._pd_separation_pair == (0, 1)
 
     def test_pd_pair_uses_stage_id_for_input_source(self, monkeypatch):
         """engine_input_source references stage_id, not list index."""
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(stage_id=10),
-            _decode_stage_cfg(stage_id=20, engine_input_source=[10]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(stage_id=10),
+                _decode_stage_cfg(stage_id=20, engine_input_source=[10]),
+            ],
+        )
         assert omni._pd_separation_pair == (0, 1)
 
 
@@ -569,15 +628,19 @@ class TestDetectPDSeparation:
 # Tests: PD config validation
 # ===================================================================
 
+
 class TestValidatePDConfig:
     """Tests for Omni._validate_pd_separation_config()."""
 
     def test_valid_config_passes(self, monkeypatch):
         """Valid PD config should not raise."""
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(),
-            _decode_stage_cfg(engine_input_source=[0]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(),
+                _decode_stage_cfg(engine_input_source=[0]),
+            ],
+        )
         # If we got here without error, validation passed
         assert omni._pd_separation_pair == (0, 1)
 
@@ -628,31 +691,41 @@ class TestValidatePDConfig:
 # Tests: Connector info extraction
 # ===================================================================
 
+
 class TestGetPDConnectorInfo:
     """Tests for Omni._get_pd_connector_info()."""
 
     def test_extracts_engine_id(self, monkeypatch):
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(),
-            _decode_stage_cfg(engine_input_source=[0]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(),
+                _decode_stage_cfg(engine_input_source=[0]),
+            ],
+        )
         info = omni._pd_connector_info
         assert info is not None
         assert info["prefill_engine_id"] == "omni-thinker-prefill"
 
     def test_extracts_bootstrap_addr_for_mooncake(self, monkeypatch):
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(),
-            _decode_stage_cfg(engine_input_source=[0]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(),
+                _decode_stage_cfg(engine_input_source=[0]),
+            ],
+        )
         info = omni._pd_connector_info
         assert "prefill_bootstrap_addr" in info
         assert info["prefill_bootstrap_addr"] == "127.0.0.1:25201"
 
     def test_none_for_non_pd_pipeline(self, monkeypatch):
-        omni = _make_pd_omni(monkeypatch, [
-            {"stage_id": 0, "engine_args": {}, "final_output": True, "final_output_type": "text"},
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                {"stage_id": 0, "engine_args": {}, "final_output": True, "final_output_type": "text"},
+            ],
+        )
         assert omni._pd_connector_info is None
 
 
@@ -660,14 +733,18 @@ class TestGetPDConnectorInfo:
 # Tests: Prefill sampling params preparation
 # ===================================================================
 
+
 class TestPreparePrefillSamplingParams:
     """Tests for Omni._prepare_prefill_sampling_params()."""
 
     def test_sets_max_tokens_to_1(self, monkeypatch):
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(),
-            _decode_stage_cfg(engine_input_source=[0]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(),
+                _decode_stage_cfg(engine_input_source=[0]),
+            ],
+        )
         sp = SamplingParams(max_tokens=2048)
         result = omni._prepare_prefill_sampling_params("req-1", sp)
 
@@ -675,10 +752,13 @@ class TestPreparePrefillSamplingParams:
         assert result is not sp  # should be cloned
 
     def test_injects_kv_transfer_params(self, monkeypatch):
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(),
-            _decode_stage_cfg(engine_input_source=[0]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(),
+                _decode_stage_cfg(engine_input_source=[0]),
+            ],
+        )
         sp = SamplingParams(max_tokens=2048)
         result = omni._prepare_prefill_sampling_params("req-1", sp)
 
@@ -688,10 +768,13 @@ class TestPreparePrefillSamplingParams:
         assert kv_params["transfer_id"] == "xfer-req-1"
 
     def test_preserves_existing_extra_args(self, monkeypatch):
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(),
-            _decode_stage_cfg(engine_input_source=[0]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(),
+                _decode_stage_cfg(engine_input_source=[0]),
+            ],
+        )
         sp = SamplingParams(max_tokens=2048, extra_args={"custom_key": "value"})
         result = omni._prepare_prefill_sampling_params("req-1", sp)
 
@@ -699,10 +782,13 @@ class TestPreparePrefillSamplingParams:
         assert "kv_transfer_params" in result.extra_args
 
     def test_does_not_mutate_original(self, monkeypatch):
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(),
-            _decode_stage_cfg(engine_input_source=[0]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(),
+                _decode_stage_cfg(engine_input_source=[0]),
+            ],
+        )
         sp = SamplingParams(max_tokens=2048)
         _ = omni._prepare_prefill_sampling_params("req-1", sp)
 
@@ -713,6 +799,7 @@ class TestPreparePrefillSamplingParams:
 # ===================================================================
 # Tests: Sampling params auto-duplication for PD split
 # ===================================================================
+
 
 class TestSamplingParamsAutoDuplication:
     """When user provides N-1 sampling params (for logical stages), the
@@ -727,12 +814,16 @@ class TestSamplingParamsAutoDuplication:
             mp.setattr(uuid, "uuid4", lambda: test_uuid)
             mp.setattr(omni_module, "uuid", uuid)
 
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(stage_id=0),
-            _decode_stage_cfg(stage_id=1, engine_input_source=[0]),
-            _talker_stage_cfg(stage_id=2, engine_input_source=[1]),
-            _code2wav_stage_cfg(stage_id=3, engine_input_source=[2]),
-        ], extra_setup=_extra_setup)
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(stage_id=0),
+                _decode_stage_cfg(stage_id=1, engine_input_source=[0]),
+                _talker_stage_cfg(stage_id=2, engine_input_source=[1]),
+                _code2wav_stage_cfg(stage_id=3, engine_input_source=[2]),
+            ],
+            extra_setup=_extra_setup,
+        )
 
         assert omni._pd_separation_pair == (0, 1)
         assert len(omni.stage_list) == 4
@@ -740,11 +831,13 @@ class TestSamplingParamsAutoDuplication:
         # Simulate outputs for all stages
         expected_rid = f"0_{test_uuid}"
         for i in range(4):
-            omni.stage_list[i]._out_q.put_nowait({
-                "request_id": expected_rid,
-                "engine_outputs": [MagicMock(request_id=expected_rid, outputs=[MagicMock(token_ids=[1, 2])])],
-                "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
-            })
+            omni.stage_list[i]._out_q.put_nowait(
+                {
+                    "request_id": expected_rid,
+                    "engine_outputs": [MagicMock(request_id=expected_rid, outputs=[MagicMock(token_ids=[1, 2])])],
+                    "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+                }
+            )
 
         # Provide 3 params (one less than 4 stages) - should auto-duplicate
         sp_thinker = SamplingParams(temperature=0.4, max_tokens=2048)
@@ -763,21 +856,27 @@ class TestSamplingParamsAutoDuplication:
 # Tests: KV transfer params normalization
 # ===================================================================
 
-class TestNormalizeKVTransferParams:
 
+class TestNormalizeKVTransferParams:
     def test_dict_passthrough(self, monkeypatch):
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(),
-            _decode_stage_cfg(engine_input_source=[0]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(),
+                _decode_stage_cfg(engine_input_source=[0]),
+            ],
+        )
         d = {"transfer_id": "test", "do_remote_decode": True}
         assert omni._normalize_kv_transfer_params(d) is d
 
     def test_none_returns_none(self, monkeypatch):
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(),
-            _decode_stage_cfg(engine_input_source=[0]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(),
+                _decode_stage_cfg(engine_input_source=[0]),
+            ],
+        )
         assert omni._normalize_kv_transfer_params(None) is None
 
     def test_dataclass_to_dict(self, monkeypatch):
@@ -788,10 +887,13 @@ class TestNormalizeKVTransferParams:
             transfer_id: str = "test"
             do_remote_decode: bool = True
 
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(),
-            _decode_stage_cfg(engine_input_source=[0]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(),
+                _decode_stage_cfg(engine_input_source=[0]),
+            ],
+        )
         result = omni._normalize_kv_transfer_params(FakeKVParams())
         assert isinstance(result, dict)
         assert result["transfer_id"] == "test"
@@ -801,21 +903,27 @@ class TestNormalizeKVTransferParams:
 # Tests: _kv_cfg_to_dict
 # ===================================================================
 
-class TestKvCfgToDict:
 
+class TestKvCfgToDict:
     def test_dict_passthrough(self, monkeypatch):
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(),
-            _decode_stage_cfg(engine_input_source=[0]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(),
+                _decode_stage_cfg(engine_input_source=[0]),
+            ],
+        )
         d = {"kv_connector": "MooncakeConnector"}
         assert omni._kv_cfg_to_dict(d) is d
 
     def test_none_returns_empty(self, monkeypatch):
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(),
-            _decode_stage_cfg(engine_input_source=[0]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(),
+                _decode_stage_cfg(engine_input_source=[0]),
+            ],
+        )
         assert omni._kv_cfg_to_dict(None) == {}
 
     def test_dataclass_converted(self, monkeypatch):
@@ -826,10 +934,13 @@ class TestKvCfgToDict:
             kv_connector: str = "TestConnector"
             kv_role: str = "kv_producer"
 
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(),
-            _decode_stage_cfg(engine_input_source=[0]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(),
+                _decode_stage_cfg(engine_input_source=[0]),
+            ],
+        )
         result = omni._kv_cfg_to_dict(FakeCfg())
         assert result["kv_connector"] == "TestConnector"
         assert result["kv_role"] == "kv_producer"
@@ -838,6 +949,7 @@ class TestKvCfgToDict:
 # ===================================================================
 # Tests: PD routing in scheduling loop
 # ===================================================================
+
 
 class TestPDRouting:
     """Test that the scheduling loop correctly routes requests from
@@ -852,24 +964,32 @@ class TestPDRouting:
             mp.setattr(uuid, "uuid4", lambda: test_uuid)
             mp.setattr(omni_module, "uuid", uuid)
 
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(stage_id=0),
-            _decode_stage_cfg(stage_id=1, engine_input_source=[0]),
-        ], extra_setup=_extra_setup)
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(stage_id=0),
+                _decode_stage_cfg(stage_id=1, engine_input_source=[0]),
+            ],
+            extra_setup=_extra_setup,
+        )
 
         expected_rid = f"0_{test_uuid}"
 
         # Put stage outputs in both queues
-        omni.stage_list[0]._out_q.put_nowait({
-            "request_id": expected_rid,
-            "engine_outputs": [MagicMock(request_id=expected_rid, outputs=[MagicMock(token_ids=[1])])],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
-        })
-        omni.stage_list[1]._out_q.put_nowait({
-            "request_id": expected_rid,
-            "engine_outputs": [MagicMock(request_id=expected_rid, outputs=[MagicMock(token_ids=[1, 2, 3])])],
-            "metrics": {"num_tokens_out": 3, "stage_gen_time_ms": 50.0},
-        })
+        omni.stage_list[0]._out_q.put_nowait(
+            {
+                "request_id": expected_rid,
+                "engine_outputs": [MagicMock(request_id=expected_rid, outputs=[MagicMock(token_ids=[1])])],
+                "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            }
+        )
+        omni.stage_list[1]._out_q.put_nowait(
+            {
+                "request_id": expected_rid,
+                "engine_outputs": [MagicMock(request_id=expected_rid, outputs=[MagicMock(token_ids=[1, 2, 3])])],
+                "metrics": {"num_tokens_out": 3, "stage_gen_time_ms": 50.0},
+            }
+        )
 
         sp_list = [SamplingParams(max_tokens=2048), SamplingParams(max_tokens=2048)]
         omni.generate(prompts=["hello"], sampling_params_list=sp_list)
@@ -891,24 +1011,32 @@ class TestPDRouting:
             mp.setattr(uuid, "uuid4", lambda: test_uuid)
             mp.setattr(omni_module, "uuid", uuid)
 
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(stage_id=0),
-            _decode_stage_cfg(stage_id=1, engine_input_source=[0]),
-        ], extra_setup=_extra_setup)
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(stage_id=0),
+                _decode_stage_cfg(stage_id=1, engine_input_source=[0]),
+            ],
+            extra_setup=_extra_setup,
+        )
 
         expected_rid = f"0_{test_uuid}"
         original_prompt = "test prompt for PD"
 
-        omni.stage_list[0]._out_q.put_nowait({
-            "request_id": expected_rid,
-            "engine_outputs": [MagicMock(request_id=expected_rid, outputs=[MagicMock(token_ids=[1])])],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
-        })
-        omni.stage_list[1]._out_q.put_nowait({
-            "request_id": expected_rid,
-            "engine_outputs": [MagicMock(request_id=expected_rid, outputs=[MagicMock(token_ids=[1, 2, 3])])],
-            "metrics": {"num_tokens_out": 3, "stage_gen_time_ms": 50.0},
-        })
+        omni.stage_list[0]._out_q.put_nowait(
+            {
+                "request_id": expected_rid,
+                "engine_outputs": [MagicMock(request_id=expected_rid, outputs=[MagicMock(token_ids=[1])])],
+                "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            }
+        )
+        omni.stage_list[1]._out_q.put_nowait(
+            {
+                "request_id": expected_rid,
+                "engine_outputs": [MagicMock(request_id=expected_rid, outputs=[MagicMock(token_ids=[1, 2, 3])])],
+                "metrics": {"num_tokens_out": 3, "stage_gen_time_ms": 50.0},
+            }
+        )
 
         sp_list = [SamplingParams(max_tokens=2048), SamplingParams(max_tokens=2048)]
         omni.generate(prompts=[original_prompt], sampling_params_list=sp_list)
@@ -932,23 +1060,31 @@ class TestPDRouting:
             mp.setattr(uuid, "uuid4", lambda: test_uuid)
             mp.setattr(omni_module, "uuid", uuid)
 
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(stage_id=0),
-            _decode_stage_cfg(stage_id=1, engine_input_source=[0]),
-        ], extra_setup=_extra_setup)
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(stage_id=0),
+                _decode_stage_cfg(stage_id=1, engine_input_source=[0]),
+            ],
+            extra_setup=_extra_setup,
+        )
 
         expected_rid = f"0_{test_uuid}"
 
-        omni.stage_list[0]._out_q.put_nowait({
-            "request_id": expected_rid,
-            "engine_outputs": [MagicMock(request_id=expected_rid, outputs=[MagicMock(token_ids=[1])])],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
-        })
-        omni.stage_list[1]._out_q.put_nowait({
-            "request_id": expected_rid,
-            "engine_outputs": [MagicMock(request_id=expected_rid, outputs=[MagicMock(token_ids=[1, 2, 3])])],
-            "metrics": {"num_tokens_out": 3, "stage_gen_time_ms": 50.0},
-        })
+        omni.stage_list[0]._out_q.put_nowait(
+            {
+                "request_id": expected_rid,
+                "engine_outputs": [MagicMock(request_id=expected_rid, outputs=[MagicMock(token_ids=[1])])],
+                "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            }
+        )
+        omni.stage_list[1]._out_q.put_nowait(
+            {
+                "request_id": expected_rid,
+                "engine_outputs": [MagicMock(request_id=expected_rid, outputs=[MagicMock(token_ids=[1, 2, 3])])],
+                "metrics": {"num_tokens_out": 3, "stage_gen_time_ms": 50.0},
+            }
+        )
 
         sp_list = [SamplingParams(max_tokens=2048), SamplingParams(max_tokens=2048)]
         omni.generate(prompts=["hello"], sampling_params_list=sp_list)
@@ -967,29 +1103,38 @@ class TestPDRouting:
 # Tests: KV params cleanup
 # ===================================================================
 
-class TestKVParamsCleanup:
 
+class TestKVParamsCleanup:
     def test_drop_cleans_up(self, monkeypatch):
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(),
-            _decode_stage_cfg(engine_input_source=[0]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(),
+                _decode_stage_cfg(engine_input_source=[0]),
+            ],
+        )
         omni._pd_kv_params_by_req["req-1"] = {"transfer_id": "xfer-1"}
         omni._drop_pd_kv_params("req-1")
         assert "req-1" not in omni._pd_kv_params_by_req
 
     def test_drop_nonexistent_is_noop(self, monkeypatch):
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(),
-            _decode_stage_cfg(engine_input_source=[0]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(),
+                _decode_stage_cfg(engine_input_source=[0]),
+            ],
+        )
         omni._drop_pd_kv_params("nonexistent")  # should not raise
 
     def test_pop_returns_stored_params(self, monkeypatch):
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(),
-            _decode_stage_cfg(engine_input_source=[0]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(),
+                _decode_stage_cfg(engine_input_source=[0]),
+            ],
+        )
         stored = {"transfer_id": "xfer-1", "extra_field": "value"}
         omni._pd_kv_params_by_req["req-1"] = stored
 
@@ -998,10 +1143,13 @@ class TestKVParamsCleanup:
         assert "req-1" not in omni._pd_kv_params_by_req
 
     def test_pop_uses_fallback_when_no_stored(self, monkeypatch):
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(),
-            _decode_stage_cfg(engine_input_source=[0]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(),
+                _decode_stage_cfg(engine_input_source=[0]),
+            ],
+        )
         fallback = {"transfer_id": "xfer-fallback"}
         result = omni._pop_pd_kv_params("req-1", fallback=fallback)
         assert result == fallback
@@ -1011,11 +1159,12 @@ class TestKVParamsCleanup:
 # Tests: Config YAML loads without error
 # ===================================================================
 
-class TestPDYAMLConfig:
 
+class TestPDYAMLConfig:
     def test_pd_yaml_loads(self):
         """The PD separation YAML config should load without errors."""
         import os
+
         yaml_path = os.path.join(
             os.path.dirname(__file__),
             "../../vllm_omni/model_executor/stage_configs/qwen3_omni_moe_pd_separation.yaml",
@@ -1025,6 +1174,7 @@ class TestPDYAMLConfig:
             pytest.skip("PD separation YAML not found")
 
         from omegaconf import OmegaConf
+
         cfg = OmegaConf.load(yaml_path)
         stages = cfg.stage_args
         assert len(stages) == 4
@@ -1051,6 +1201,7 @@ class TestPDYAMLConfig:
 # ===================================================================
 # Tests: MooncakeConnector monkey-patch
 # ===================================================================
+
 
 class TestMooncakeConnectorPatch:
     """Tests for the embedded MooncakeConnector monkey-patch that fixes
@@ -1093,6 +1244,7 @@ class TestMooncakeConnectorPatch:
                     # args[1] is stage_payload for _stage_worker
                     if args and len(args) >= 2:
                         captured_payloads.append(args[1])
+
                 def start(self):
                     pass
 
@@ -1117,6 +1269,7 @@ class TestMooncakeConnectorPatch:
         from vllm_omni.distributed.kv_transfer.patched_mooncake_connector import (
             create_patched_mooncake_connector,
         )
+
         PatchedCls = create_patched_mooncake_connector(engine_id="test-engine")
         assert issubclass(PatchedCls, OriginalMC)
 
@@ -1134,6 +1287,7 @@ class TestMooncakeConnectorPatch:
         from vllm_omni.distributed.kv_transfer.patched_mooncake_connector import (
             create_patched_mooncake_connector,
         )
+
         PatchedCls = create_patched_mooncake_connector(engine_id="prefill-0")
 
         # Create a mock instance without calling __init__ (avoids needing
@@ -1168,7 +1322,7 @@ class TestMooncakeConnectorPatch:
         kv_transfer_params.
         """
         try:
-            from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_connector import (
+            from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_connector import (  # noqa: F401
                 MooncakeConnector as OriginalMC,
             )
         except ImportError:
@@ -1178,6 +1332,7 @@ class TestMooncakeConnectorPatch:
             PatchedRecvReqMeta,
             create_patched_mooncake_connector,
         )
+
         PatchedCls = create_patched_mooncake_connector(engine_id="decode-0")
 
         instance = PatchedCls.__new__(PatchedCls)
@@ -1208,43 +1363,56 @@ class TestMooncakeConnectorPatch:
 # Tests: Stop neutralization in prefill sampling params
 # ===================================================================
 
+
 class TestPrefillStopNeutralization:
     """Tests that _prepare_prefill_sampling_params neutralizes stop
     conditions to ensure finish_reason='length'.
     """
 
     def test_clears_stop_strings(self, monkeypatch):
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(),
-            _decode_stage_cfg(engine_input_source=[0]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(),
+                _decode_stage_cfg(engine_input_source=[0]),
+            ],
+        )
         sp = SamplingParams(max_tokens=2048, stop=["</s>", "STOP"])
         result = omni._prepare_prefill_sampling_params("req-1", sp)
         assert result.stop == []
 
     def test_clears_stop_token_ids(self, monkeypatch):
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(),
-            _decode_stage_cfg(engine_input_source=[0]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(),
+                _decode_stage_cfg(engine_input_source=[0]),
+            ],
+        )
         sp = SamplingParams(max_tokens=2048, stop_token_ids=[151643, 151644])
         result = omni._prepare_prefill_sampling_params("req-1", sp)
         assert result.stop_token_ids == []
 
     def test_clears_include_stop_str_in_output(self, monkeypatch):
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(),
-            _decode_stage_cfg(engine_input_source=[0]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(),
+                _decode_stage_cfg(engine_input_source=[0]),
+            ],
+        )
         sp = SamplingParams(max_tokens=2048, include_stop_str_in_output=True)
         result = omni._prepare_prefill_sampling_params("req-1", sp)
         assert result.include_stop_str_in_output is False
 
     def test_original_sp_unchanged(self, monkeypatch):
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(),
-            _decode_stage_cfg(engine_input_source=[0]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(),
+                _decode_stage_cfg(engine_input_source=[0]),
+            ],
+        )
         sp = SamplingParams(max_tokens=2048, stop=["</s>"], stop_token_ids=[151643])
         _ = omni._prepare_prefill_sampling_params("req-1", sp)
         assert sp.stop == ["</s>"]
@@ -1265,6 +1433,7 @@ class TestPrefillStopNeutralization:
 # ===================================================================
 # Tests: TP size validation
 # ===================================================================
+
 
 class TestTPSizeValidation:
     """Tests that _validate_pd_separation_config checks tensor_parallel_size."""
@@ -1289,8 +1458,11 @@ class TestTPSizeValidation:
 
     def test_default_tp_no_error(self, monkeypatch):
         """Stages without explicit TP (defaults to 1) should pass."""
-        omni = _make_pd_omni(monkeypatch, [
-            _prefill_stage_cfg(),
-            _decode_stage_cfg(engine_input_source=[0]),
-        ])
+        omni = _make_pd_omni(
+            monkeypatch,
+            [
+                _prefill_stage_cfg(),
+                _decode_stage_cfg(engine_input_source=[0]),
+            ],
+        )
         assert omni._pd_separation_pair == (0, 1)

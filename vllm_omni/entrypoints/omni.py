@@ -10,7 +10,6 @@ import weakref
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, is_dataclass
-from pprint import pformat
 from typing import Any, Literal, TypeVar, overload
 
 import huggingface_hub
@@ -916,7 +915,7 @@ class OmniBase:
     def is_async(self) -> bool:
         return False
 
-# ------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # PD (Prefill-Decode) disaggregation helpers
     # ------------------------------------------------------------------
 
@@ -955,8 +954,7 @@ class OmniBase:
 
         if len(pd_pairs) > 1:
             raise ValueError(
-                f"Multiple PD pairs detected ({pd_pairs}); "
-                "only a single PD pair per pipeline is supported"
+                f"Multiple PD pairs detected ({pd_pairs}); only a single PD pair per pipeline is supported"
             )
         return pd_pairs[0] if pd_pairs else None
 
@@ -1031,8 +1029,7 @@ class OmniBase:
             cfg_dict = self._kv_cfg_to_dict(cfg)
             if not cfg_dict:
                 raise ValueError(
-                    f"Stage-{stage.stage_id} kv_transfer_config "
-                    f"({type(cfg).__name__}) could not be parsed into a dict"
+                    f"Stage-{stage.stage_id} kv_transfer_config ({type(cfg).__name__}) could not be parsed into a dict"
                 )
             return cfg_dict
 
@@ -1042,29 +1039,18 @@ class OmniBase:
         p_role = p_cfg.get("kv_role")
         d_role = d_cfg.get("kv_role")
         if p_role not in ("kv_producer", "kv_both"):
-            raise ValueError(
-                f"Prefill stage-{p_id} kv_role must be 'kv_producer' or "
-                f"'kv_both', got '{p_role}'"
-            )
+            raise ValueError(f"Prefill stage-{p_id} kv_role must be 'kv_producer' or 'kv_both', got '{p_role}'")
         if d_role not in ("kv_consumer", "kv_both"):
-            raise ValueError(
-                f"Decode stage-{d_id} kv_role must be 'kv_consumer' or "
-                f"'kv_both', got '{d_role}'"
-            )
+            raise ValueError(f"Decode stage-{d_id} kv_role must be 'kv_consumer' or 'kv_both', got '{d_role}'")
 
         d_sources = list(getattr(d_stage, "engine_input_source", []) or [])
         if p_id not in d_sources and p_stage.stage_id not in d_sources:
-            raise ValueError(
-                f"Decode stage-{d_id} must list prefill stage-{p_id} in engine_input_source"
-            )
+            raise ValueError(f"Decode stage-{d_id} must list prefill stage-{p_id} in engine_input_source")
 
         p_conn = p_cfg.get("kv_connector")
         d_conn = d_cfg.get("kv_connector")
         if p_conn != d_conn:
-            raise ValueError(
-                f"PD connector mismatch: prefill uses '{p_conn}', "
-                f"decode uses '{d_conn}'"
-            )
+            raise ValueError(f"PD connector mismatch: prefill uses '{p_conn}', decode uses '{d_conn}'")
         if not p_conn:
             raise ValueError("PD disaggregation requires kv_connector to be set in kv_transfer_config")
 
@@ -1072,18 +1058,13 @@ class OmniBase:
             p_val = p_cfg.get(key)
             d_val = d_cfg.get(key)
             if p_val is not None and d_val is not None and p_val != d_val:
-                raise ValueError(
-                    f"PD {key} mismatch: prefill uses '{p_val}', decode uses '{d_val}'"
-                )
+                raise ValueError(f"PD {key} mismatch: prefill uses '{p_val}', decode uses '{d_val}'")
 
         # Validate tensor_parallel_size matches between prefill and decode
         p_tp = getattr(getattr(p_stage, "engine_args", None), "tensor_parallel_size", 1)
         d_tp = getattr(getattr(d_stage, "engine_args", None), "tensor_parallel_size", 1)
         if p_tp != d_tp:
-            raise ValueError(
-                f"PD stages must have matching tensor_parallel_size: "
-                f"prefill={p_tp}, decode={d_tp}"
-            )
+            raise ValueError(f"PD stages must have matching tensor_parallel_size: prefill={p_tp}, decode={d_tp}")
 
     def _get_pd_connector_info(self) -> dict[str, Any] | None:
         """Extract prefill engine KV connector info from stage config."""
@@ -1151,8 +1132,7 @@ class OmniBase:
         )
         sp.extra_args["kv_transfer_params"] = merged
         logger.debug(
-            "[PD] _prepare_prefill_sampling_params: req=%s max_tokens=%s "
-            "kv_transfer_params=%s extra_args_id=%s",
+            "[PD] _prepare_prefill_sampling_params: req=%s max_tokens=%s kv_transfer_params=%s extra_args_id=%s",
             req_id,
             sp.max_tokens,
             merged,
@@ -1344,17 +1324,13 @@ class Omni(OmniBase):
         # splits thinker into two physical stages (prefill + decode).
         # Auto-duplicate the thinker params for the decode stage so the
         # caller doesn't need to know about the internal split.
-        if (
-            self._pd_separation_pair is not None
-            and len(sampling_params_list) == len(self.stage_list) - 1
-        ):
+        if self._pd_separation_pair is not None and len(sampling_params_list) == len(self.stage_list) - 1:
             p_id, d_id = self._pd_separation_pair
             sp_list = list(sampling_params_list)
             sp_list.insert(d_id, sp_list[p_id])
             sampling_params_list = sp_list
             logger.debug(
-                "[%s] PD mode: auto-duplicated thinker sampling params "
-                "for decode stage %d",
+                "[%s] PD mode: auto-duplicated thinker sampling params for decode stage %d",
                 self._name,
                 d_id,
             )
@@ -1418,10 +1394,7 @@ class Omni(OmniBase):
         metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
 
         # Check if stage 0 is the prefill-only stage in a PD pair
-        _seed_is_prefill = (
-            self._pd_separation_pair is not None
-            and self._pd_separation_pair[0] == 0
-        )
+        _seed_is_prefill = self._pd_separation_pair is not None and self._pd_separation_pair[0] == 0
 
         for req_id, prompt in request_id_to_prompt.items():
             sp0 = sampling_params_list[0]  # type: ignore[index]
@@ -1588,9 +1561,9 @@ class Omni(OmniBase):
                     # PD disaggregation: when routing from prefill to decode,
                     # re-submit the original prompt so the decode engine can
                     # load the prefilled KV cache via vLLM's native connector.
-                    is_pd_routing = (
-                        self._pd_separation_pair is not None
-                        and self._pd_separation_pair == (stage_id, next_stage_id)
+                    is_pd_routing = self._pd_separation_pair is not None and self._pd_separation_pair == (
+                        stage_id,
+                        next_stage_id,
                     )
 
                     if is_pd_routing:
@@ -1630,9 +1603,7 @@ class Omni(OmniBase):
 
                         # If the prefill output carried connector metadata,
                         # merge it in (some connectors return additional info).
-                        kv_params_from_output = self._pop_pd_kv_params(
-                            req_id, result.get("kv_transfer_params")
-                        )
+                        kv_params_from_output = self._pop_pd_kv_params(req_id, result.get("kv_transfer_params"))
                         if kv_params_from_output:
                             decode_kv_params.update(kv_params_from_output)
 
@@ -1644,8 +1615,7 @@ class Omni(OmniBase):
 
                         sp_next.extra_args["kv_transfer_params"] = decode_kv_params
                         logger.info(
-                            "[%s] PD routing: stage-%d→stage-%d, req %s, "
-                            "remote_request_id=%s, remote=%s:%s",
+                            "[%s] PD routing: stage-%d→stage-%d, req %s, remote_request_id=%s, remote=%s:%s",
                             self._name,
                             stage_id,
                             next_stage_id,
@@ -1679,10 +1649,7 @@ class Omni(OmniBase):
 
                     # If we are about to enter the prefill stage (when it is not stage-0),
                     # apply prefill-only sampling params.
-                    if (
-                        self._pd_separation_pair is not None
-                        and next_stage_id == self._pd_separation_pair[0]
-                    ):
+                    if self._pd_separation_pair is not None and next_stage_id == self._pd_separation_pair[0]:
                         sp_next = self._prepare_prefill_sampling_params(req_id, sp_next)
 
                     # Check if we have a connector for this edge

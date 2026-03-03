@@ -341,10 +341,7 @@ class AsyncOmni(OmniBase):
 
             # PD disaggregation: auto-duplicate thinker sampling params for
             # the decode stage when the caller provides N-1 params.
-            if (
-                self._pd_separation_pair is not None
-                and len(sampling_params_list) == len(self.stage_list) - 1
-            ):
+            if self._pd_separation_pair is not None and len(sampling_params_list) == len(self.stage_list) - 1:
                 p_id, d_id = self._pd_separation_pair
                 sp_list = list(sampling_params_list)
                 sp_list.insert(d_id, sp_list[p_id])
@@ -388,14 +385,10 @@ class AsyncOmni(OmniBase):
 
             # PD disaggregation: prepare prefill-only sampling params for
             # stage-0 (max_tokens=1, do_remote_decode=True).
-            if (
-                self._pd_separation_pair is not None
-                and self._pd_separation_pair[0] == 0
-            ):
+            if self._pd_separation_pair is not None and self._pd_separation_pair[0] == 0:
                 sp0 = self._prepare_prefill_sampling_params(request_id, sp0)
                 logger.info(
-                    "[%s] PD prefill SP prepared for req %s: max_tokens=%s, "
-                    "extra_args keys=%s, kv_transfer_params=%s",
+                    "[%s] PD prefill SP prepared for req %s: max_tokens=%s, extra_args keys=%s, kv_transfer_params=%s",
                     self._name,
                     request_id,
                     sp0.max_tokens,
@@ -540,9 +533,9 @@ class AsyncOmni(OmniBase):
 
                 # PD disaggregation: route from prefill → decode with
                 # original prompt and decode-side kv_transfer_params.
-                is_pd_routing = (
-                    self._pd_separation_pair is not None
-                    and self._pd_separation_pair == (stage_id, next_stage_id)
+                is_pd_routing = self._pd_separation_pair is not None and self._pd_separation_pair == (
+                    stage_id,
+                    next_stage_id,
                 )
 
                 if is_pd_routing:
@@ -551,13 +544,16 @@ class AsyncOmni(OmniBase):
                         _eo_kv = getattr(_eo, "kv_transfer_params", None)
                         _eo_ntoks = (
                             sum(len(o.token_ids) for o in _eo.outputs)
-                            if hasattr(_eo, "outputs") and _eo.outputs else "?"
+                            if hasattr(_eo, "outputs") and _eo.outputs
+                            else "?"
                         )
                         logger.debug(
-                            "[%s][PD] Prefill stage-%d output for req %s: "
-                            "num_output_tokens=%s, kv_transfer_params=%s",
-                            self._name, stage_id, request_id,
-                            _eo_ntoks, _eo_kv,
+                            "[%s][PD] Prefill stage-%d output for req %s: num_output_tokens=%s, kv_transfer_params=%s",
+                            self._name,
+                            stage_id,
+                            request_id,
+                            _eo_ntoks,
+                            _eo_kv,
                         )
                     next_inputs = [prompt] if not isinstance(prompt, list) else prompt
                     sp_next = sampling_params_list[next_stage_id].clone()

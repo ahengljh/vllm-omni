@@ -782,12 +782,7 @@ class TestThinker2TalkerPDMode:
         )
 
         # Get the decode stage's TTS embed for comparison
-        decode_tts_bos = (
-            stage_list[1]
-            .engine_outputs[0]
-            .outputs[0]
-            .multimodal_output["tts_bos_embed"]
-        )
+        decode_tts_bos = stage_list[1].engine_outputs[0].outputs[0].multimodal_output["tts_bos_embed"]
 
         results = thinker2talker(stage_list, engine_input_source=[1])
         info = results[0]["additional_information"]
@@ -916,13 +911,7 @@ class TestTalker2Code2Wav:
 
         # Manually compute expected: codes[-seq_len:].transpose(0,1).reshape(-1)
         original_codes = talker_out.outputs[0].multimodal_output["code_predictor_codes"]
-        expected = (
-            original_codes[-seq_len:]
-            .to(torch.long)
-            .transpose(0, 1)
-            .reshape(-1)
-            .tolist()
-        )
+        expected = original_codes[-seq_len:].to(torch.long).transpose(0, 1).reshape(-1).tolist()
         assert result_codes == expected
 
     def test_codes_are_all_ints(self):
@@ -1534,9 +1523,7 @@ class TestPDAudioPipelineIntegration:
             engine_outputs=[decode_out],
         )
 
-        results = thinker2talker(
-            [prefill_stage, decode_stage], engine_input_source=[1]
-        )
+        results = thinker2talker([prefill_stage, decode_stage], engine_input_source=[1])
         merged_emb = results[0]["additional_information"]["thinker_prefill_embeddings"]
 
         # First part (prompt) should be from prefill (positive values)
@@ -1600,8 +1587,6 @@ class TestPDAudioPipelineIntegration:
         )
         talker_stage = _FakeStage(stage_id=1, engine_outputs=[talker_out2])
 
-        c2w_inputs = talker2code2wav(
-            [thinker_stage, talker_stage], engine_input_source=[1]
-        )
+        c2w_inputs = talker2code2wav([thinker_stage, talker_stage], engine_input_source=[1])
         assert len(c2w_inputs) == 1
         assert len(c2w_inputs[0]["prompt_token_ids"]) == talker_seq * num_q

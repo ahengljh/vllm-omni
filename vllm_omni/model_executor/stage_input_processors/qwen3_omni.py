@@ -173,10 +173,7 @@ def _get_prefill_stage(stage_list: list[Any], source_stage_id: int) -> Any | Non
     if not getattr(source_stage, "is_decode_only", False):
         return None
     prev_stage = stage_list[source_stage_id - 1]
-    if (
-        getattr(prev_stage, "is_prefill_only", False)
-        and prev_stage.engine_outputs is not None
-    ):
+    if getattr(prev_stage, "is_prefill_only", False) and prev_stage.engine_outputs is not None:
         return prev_stage
     return None
 
@@ -221,8 +218,7 @@ def _merge_pd_embeddings(
     merged_hid = torch.cat([p_hid, decode_hid[overlap:]], dim=0)
 
     logger.debug(
-        "[PD] Merged prefill(%d) + decode(%d) overlap=%d → %d embeddings "
-        "(expected=%s)",
+        "[PD] Merged prefill(%d) + decode(%d) overlap=%d → %d embeddings (expected=%s)",
         p_emb.shape[0],
         decode_emb.shape[0],
         overlap,
@@ -282,8 +278,7 @@ def thinker2talker(
         expected_total = len(thinker_output.prompt_token_ids) + len(output.token_ids)
 
         logger.debug(
-            "[PD] thinker2talker: prompt_len=%d, output_len=%d, "
-            "expected_total=%d, decode_emb=%d, decode_hid=%d",
+            "[PD] thinker2talker: prompt_len=%d, output_len=%d, expected_total=%d, decode_emb=%d, decode_hid=%d",
             len(thinker_output.prompt_token_ids),
             len(output.token_ids),
             expected_total,
@@ -298,7 +293,10 @@ def thinker2talker(
                 prefill_eo = prefill_eos[min(i, len(prefill_eos) - 1)]
                 prefill_mm = prefill_eo.outputs[0].multimodal_output
                 decode_emb, decode_hid = _merge_pd_embeddings(
-                    decode_emb, decode_hid, prefill_mm, device,
+                    decode_emb,
+                    decode_hid,
+                    prefill_mm,
+                    device,
                     expected_total=expected_total,
                 )
             except Exception as exc:
@@ -309,11 +307,7 @@ def thinker2talker(
             val = output.multimodal_output.get(key)
             if val is None and prefill_stage is not None:
                 try:
-                    val = (
-                        prefill_stage.engine_outputs[0]
-                        .outputs[0]
-                        .multimodal_output.get(key)
-                    )
+                    val = prefill_stage.engine_outputs[0].outputs[0].multimodal_output.get(key)
                 except Exception:
                     pass
             return val.detach().to(device=device, dtype=torch.float) if val is not None else None

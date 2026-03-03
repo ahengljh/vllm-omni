@@ -49,7 +49,6 @@ from vllm_omni.entrypoints.stage_utils import (
     _to_dict,
     is_profiler_task,
     maybe_dump_to_shm,
-    maybe_load_from_ipc,
     set_stage_devices,
 )
 from vllm_omni.entrypoints.utils import detect_pid_host, filter_dataclass_kwargs
@@ -797,6 +796,7 @@ def _stage_worker(
         _kv_cfg = stage_payload.get("engine_args", {}).get("kv_transfer_config", {})
         _engine_id = _kv_cfg.get("engine_id") if isinstance(_kv_cfg, dict) else None
         from vllm_omni.distributed.kv_transfer.monkey_patch import apply_mooncake_connector_patch
+
         apply_mooncake_connector_patch(engine_id=_engine_id)
 
     # IMPORTANT: Ensure vLLM's internal multiprocessing workers (e.g., GPUARWorker /
@@ -1060,8 +1060,7 @@ def _stage_worker(
                 if "kv_transfer_params" not in sp.extra_args:
                     sp.extra_args["kv_transfer_params"] = _kv_backup
                     logger.warning(
-                        "[Stage-%d][PD] Restored kv_transfer_params from "
-                        "backup (pickle dropped extra_args)",
+                        "[Stage-%d][PD] Restored kv_transfer_params from backup (pickle dropped extra_args)",
                         stage_id,
                     )
 
@@ -1150,11 +1149,12 @@ def _stage_worker(
             # finish_reason is 'length' (FINISHED_LENGTH_CAPPED).
             if _kv_backup is not None:
                 for ro in gen_outputs:
-                    _ro_fr = getattr(ro.outputs[0], "finish_reason", None) if hasattr(ro, "outputs") and ro.outputs else None
+                    _ro_fr = (
+                        getattr(ro.outputs[0], "finish_reason", None) if hasattr(ro, "outputs") and ro.outputs else None
+                    )
                     if _ro_fr and str(_ro_fr) != "length":
                         logger.warning(
-                            "[Stage-%d][PD] finish_reason=%s (not 'length') "
-                            "— KV transfer will be skipped for req %s",
+                            "[Stage-%d][PD] finish_reason=%s (not 'length') — KV transfer will be skipped for req %s",
                             stage_id,
                             _ro_fr,
                             ro.request_id,
@@ -1281,6 +1281,7 @@ async def _stage_worker_async(
         _kv_cfg = stage_payload.get("engine_args", {}).get("kv_transfer_config", {})
         _engine_id = _kv_cfg.get("engine_id") if isinstance(_kv_cfg, dict) else None
         from vllm_omni.distributed.kv_transfer.monkey_patch import apply_mooncake_connector_patch
+
         apply_mooncake_connector_patch(engine_id=_engine_id)
 
     # IMPORTANT: Ensure vLLM's internal multiprocessing workers (e.g., GPUARWorker /
