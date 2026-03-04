@@ -62,12 +62,18 @@ def create_patched_mooncake_connector(engine_id: str | None = None):
     -------
     type
         A class that is a proper subclass of
-        ``vllm.distributed.kv_transfer.kv_connector.v1.mooncake_connector.MooncakeConnector``.
+        ``vllm...v1.mooncake.mooncake_connector.MooncakeConnector``.
     """
     # Lazy import — the GPU environment has vLLM; CI / linting may not.
-    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_connector import (
-        MooncakeConnector as _OriginalMooncakeConnector,
-    )
+    # Support both vLLM >=0.16 (mooncake subpackage) and older layouts.
+    try:
+        from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
+            MooncakeConnector as _OriginalMooncakeConnector,
+        )
+    except (ImportError, AttributeError):
+        from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_connector import (
+            MooncakeConnector as _OriginalMooncakeConnector,
+        )
 
     class PatchedMooncakeConnector(_OriginalMooncakeConnector):
         """MooncakeConnector subclass that fixes the request-ID mismatch
