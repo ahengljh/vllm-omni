@@ -16,11 +16,13 @@ def _import_mooncake_module():
     """Import MooncakeConnector module, supporting both vLLM >=0.16 and older."""
     try:
         from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import mooncake_connector
+
         return mooncake_connector
     except ImportError:
         pass
     try:
         from vllm.distributed.kv_transfer.kv_connector.v1 import mooncake_connector
+
         return mooncake_connector
     except ImportError:
         return None
@@ -42,6 +44,7 @@ def apply_mooncake_connector_patch(engine_id: str | None = None) -> bool:
     from vllm_omni.distributed.kv_transfer.patched_mooncake_connector import (
         create_patched_mooncake_connector,
     )
+
     PatchedClass = create_patched_mooncake_connector(engine_id=engine_id)
 
     _mc_module.MooncakeConnector = PatchedClass
