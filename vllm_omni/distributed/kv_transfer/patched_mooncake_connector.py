@@ -109,9 +109,12 @@ def create_patched_mooncake_connector(engine_id: str | None = None):
             self,
             request: Any,
             block_ids: list[int],
-        ) -> dict[str, Any] | None:
-            """Call the original ``request_finished``, then patch the returned
-            ``kv_transfer_params`` dict with ``remote_request_id``.
+        ) -> tuple[bool, dict[str, Any] | None]:
+            """Call the original ``request_finished``, then inject
+            ``remote_request_id`` into the returned kv_transfer_params.
+
+            Return type matches upstream vLLM 0.16:
+                ``(delay_free_blocks: bool, kv_transfer_params: dict | None)``
 
             The original implementation may store the request in
             ``_reqs_need_send`` as a ``(Request, list[int])`` tuple; we also
@@ -120,11 +123,14 @@ def create_patched_mooncake_connector(engine_id: str | None = None):
             """
             result = super().request_finished(request, block_ids)
 
+            # Unpack upstream return value: (bool, dict | None)
+            if isinstance(result, tuple) and len(result) == 2:
+                delay_free, kv_params = result
+            else:
+                # Fallback for older vLLM versions that may return differently
+                delay_free, kv_params = False, result
+
             # --- normalise _reqs_need_send values -----------------------
-            # The base class may store (Request, list[int]) tuples.  Down-
-            # stream code that iterates over the dict values sometimes
-            # expects bare list[int].  Normalise eagerly so we don't hit
-            # "tuple is not subscriptable" errors later.
             req_id = getattr(request, "request_id", None)
             if req_id and hasattr(self, "_reqs_need_send"):
                 entry = self._reqs_need_send.get(req_id)
@@ -132,21 +138,20 @@ def create_patched_mooncake_connector(engine_id: str | None = None):
                     self._reqs_need_send[req_id] = entry[1]
 
             # --- inject remote_request_id into kv_transfer_params -------
-            if result is not None and isinstance(result, dict):
-                result["remote_request_id"] = req_id or "NOT_SET"
-                # Ensure host/port are present for decode-side look-up
+            if kv_params is not None and isinstance(kv_params, dict):
+                kv_params["remote_request_id"] = req_id or "NOT_SET"
                 if hasattr(self, "side_channel_host"):
-                    result.setdefault("remote_host", self.side_channel_host)
+                    kv_params.setdefault("remote_host", self.side_channel_host)
                 if hasattr(self, "side_channel_port"):
-                    result.setdefault("remote_port", self.side_channel_port)
+                    kv_params.setdefault("remote_port", self.side_channel_port)
                 logger.debug(
                     "[PatchedMooncakeConnector] request_finished: req_id=%s remote_request_id=%s engine_id=%s",
                     req_id,
-                    result.get("remote_request_id"),
+                    kv_params.get("remote_request_id"),
                     self.engine_id,
                 )
 
-            return result
+            return delay_free, kv_params
 
         # ---- decode side: use remote_request_id for look-up ----
 
