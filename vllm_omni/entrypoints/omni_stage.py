@@ -820,7 +820,7 @@ def _stage_worker(
     if _is_prefill_only or _is_decode_only:
         _kv_cfg = stage_payload.get("engine_args", {}).get("kv_transfer_config", {})
         _engine_id = _kv_cfg.get("engine_id") if isinstance(_kv_cfg, dict) else None
-        from vllm_omni.distributed.kv_transfer.monkey_patch import apply_mooncake_connector_patch
+        from vllm_omni.distributed.kv_transfer.connector_installer import apply_mooncake_connector_patch
 
         apply_mooncake_connector_patch(engine_id=_engine_id)
 
@@ -1308,7 +1308,7 @@ async def _stage_worker_async(
     if _is_prefill_only or _is_decode_only:
         _kv_cfg = stage_payload.get("engine_args", {}).get("kv_transfer_config", {})
         _engine_id = _kv_cfg.get("engine_id") if isinstance(_kv_cfg, dict) else None
-        from vllm_omni.distributed.kv_transfer.monkey_patch import apply_mooncake_connector_patch
+        from vllm_omni.distributed.kv_transfer.connector_installer import apply_mooncake_connector_patch
 
         apply_mooncake_connector_patch(engine_id=_engine_id)
 

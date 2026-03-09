@@ -4,7 +4,7 @@ by the prefill engine under its (different) internal request ID.
 
 Usage::
 
-    from vllm_omni.distributed.kv_transfer.patched_mooncake_connector import (
+    from vllm_omni.distributed.kv_transfer.mooncake_pd_adapter import (
         create_patched_mooncake_connector,
     )
 

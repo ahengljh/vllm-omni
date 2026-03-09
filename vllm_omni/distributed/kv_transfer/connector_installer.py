@@ -1,5 +1,6 @@
-"""Monkey-patch vLLM's ``MooncakeConnector`` with the patched version
-that fixes request-ID mismatch in PD disaggregation.
+"""Install the patched ``MooncakeConnector`` globally at runtime,
+replacing vLLM's default with the PD-adapter version that fixes
+request-ID mismatch in prefill-decode disaggregation.
 """
 
 from __future__ import annotations
@@ -36,12 +37,12 @@ def apply_mooncake_connector_patch(engine_id: str | None = None) -> bool:
 
     _mc_module = _import_mooncake_module()
     if _mc_module is None:
-        logger.warning("[monkey_patch] Cannot import vLLM MooncakeConnector — patch NOT applied.")
+        logger.warning("[connector_installer] Cannot import vLLM MooncakeConnector — patch NOT applied.")
         return False
 
     _OriginalClass = _mc_module.MooncakeConnector
 
-    from vllm_omni.distributed.kv_transfer.patched_mooncake_connector import (
+    from vllm_omni.distributed.kv_transfer.mooncake_pd_adapter import (
         create_patched_mooncake_connector,
     )
 
@@ -53,5 +54,5 @@ def apply_mooncake_connector_patch(engine_id: str | None = None) -> bool:
             module.MooncakeConnector = PatchedClass
 
     _patched = True
-    logger.info("[monkey_patch] MooncakeConnector patch applied (engine_id=%s)", engine_id)
+    logger.info("[connector_installer] MooncakeConnector patch applied (engine_id=%s)", engine_id)
     return True

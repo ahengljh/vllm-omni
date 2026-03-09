@@ -1266,7 +1266,7 @@ class TestMooncakeConnectorPatch:
         except ImportError:
             pytest.skip("vLLM MooncakeConnector not available in this env")
 
-        from vllm_omni.distributed.kv_transfer.patched_mooncake_connector import (
+        from vllm_omni.distributed.kv_transfer.mooncake_pd_adapter import (
             create_patched_mooncake_connector,
         )
 
@@ -1284,7 +1284,7 @@ class TestMooncakeConnectorPatch:
         except ImportError:
             pytest.skip("vLLM MooncakeConnector not available in this env")
 
-        from vllm_omni.distributed.kv_transfer.patched_mooncake_connector import (
+        from vllm_omni.distributed.kv_transfer.mooncake_pd_adapter import (
             create_patched_mooncake_connector,
         )
 
@@ -1328,7 +1328,7 @@ class TestMooncakeConnectorPatch:
         except ImportError:
             pytest.skip("vLLM MooncakeConnector not available in this env")
 
-        from vllm_omni.distributed.kv_transfer.patched_mooncake_connector import (
+        from vllm_omni.distributed.kv_transfer.mooncake_pd_adapter import (
             PatchedRecvReqMeta,
             create_patched_mooncake_connector,
         )
