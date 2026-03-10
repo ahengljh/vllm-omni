@@ -532,8 +532,7 @@ class AsyncOmni(OmniBase):
 
                     sp_next.extra_args["kv_transfer_params"] = decode_kv_params
                     logger.debug(
-                        "[%s] PD routing: stage-%d→stage-%d, req %s, "
-                        "remote_request_id=%s, remote=%s:%s",
+                        "[%s] PD routing: stage-%d→stage-%d, req %s, remote_request_id=%s, remote=%s:%s",
                         self._name,
                         stage_id,
                         next_stage_id,

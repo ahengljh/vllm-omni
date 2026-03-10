@@ -362,9 +362,7 @@ class PDDisaggregationMixin:
 
         # User-provided params
         if sp_next.extra_args:
-            existing = self._normalize_kv_transfer_params(
-                sp_next.extra_args.get("kv_transfer_params")
-            )
+            existing = self._normalize_kv_transfer_params(sp_next.extra_args.get("kv_transfer_params"))
             if existing:
                 decode_kv_params.update(existing)
 

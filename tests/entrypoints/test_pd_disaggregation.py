@@ -1314,6 +1314,8 @@ class TestMooncakeConnectorPatch:
 
         from vllm_omni.distributed.kv_transfer.monkey_patch import (
             PatchedRecvReqMeta,
+        )
+        from vllm_omni.distributed.kv_transfer.monkey_patch import (
             _create_patched_mooncake_connector as create_patched_mooncake_connector,
         )
 
