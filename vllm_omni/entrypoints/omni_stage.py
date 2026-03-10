@@ -818,11 +818,9 @@ def _stage_worker(
     _is_prefill_only = stage_payload.get("is_prefill_only", False)
     _is_decode_only = stage_payload.get("is_decode_only", False)
     if _is_prefill_only or _is_decode_only:
-        _kv_cfg = stage_payload.get("engine_args", {}).get("kv_transfer_config", {})
-        _engine_id = _kv_cfg.get("engine_id") if isinstance(_kv_cfg, dict) else None
-        from vllm_omni.distributed.kv_transfer.connector_installer import apply_mooncake_connector_patch
+        from vllm_omni.distributed.kv_transfer.monkey_patch import apply_mooncake_connector_patch
 
-        apply_mooncake_connector_patch(engine_id=_engine_id)
+        apply_mooncake_connector_patch()
 
     # IMPORTANT: Ensure vLLM's internal multiprocessing workers (e.g., GPUARWorker /
     # GPUARModelRunner) are spawned with a fork-safe method.
@@ -1306,11 +1304,9 @@ async def _stage_worker_async(
     _is_prefill_only = stage_payload.get("is_prefill_only", False)
     _is_decode_only = stage_payload.get("is_decode_only", False)
     if _is_prefill_only or _is_decode_only:
-        _kv_cfg = stage_payload.get("engine_args", {}).get("kv_transfer_config", {})
-        _engine_id = _kv_cfg.get("engine_id") if isinstance(_kv_cfg, dict) else None
-        from vllm_omni.distributed.kv_transfer.connector_installer import apply_mooncake_connector_patch
+        from vllm_omni.distributed.kv_transfer.monkey_patch import apply_mooncake_connector_patch
 
-        apply_mooncake_connector_patch(engine_id=_engine_id)
+        apply_mooncake_connector_patch()
 
     # IMPORTANT: Ensure vLLM's internal multiprocessing workers (e.g., GPUARWorker /
     # GPUARModelRunner) are spawned with a fork-safe method.

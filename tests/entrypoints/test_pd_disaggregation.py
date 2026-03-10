@@ -501,7 +501,6 @@ def _prefill_stage_cfg(stage_id=0, **overrides):
                 "kv_role": "kv_producer",
                 "kv_rank": 0,
                 "kv_parallel_size": 2,
-                "engine_id": "omni-thinker-prefill",
                 "kv_connector_extra_config": {"mooncake_bootstrap_port": 25201},
             },
         },
@@ -523,7 +522,6 @@ def _decode_stage_cfg(stage_id=1, engine_input_source=None, **overrides):
                 "kv_role": "kv_consumer",
                 "kv_rank": 1,
                 "kv_parallel_size": 2,
-                "engine_id": "omni-thinker-decode",
                 "kv_connector_extra_config": {"mooncake_bootstrap_port": 25202},
             },
         },
@@ -694,18 +692,6 @@ class TestValidatePDConfig:
 
 class TestGetPDConnectorInfo:
     """Tests for Omni._get_pd_connector_info()."""
-
-    def test_extracts_engine_id(self, monkeypatch):
-        omni = _make_pd_omni(
-            monkeypatch,
-            [
-                _prefill_stage_cfg(),
-                _decode_stage_cfg(engine_input_source=[0]),
-            ],
-        )
-        info = omni._pd_connector_info
-        assert info is not None
-        assert info["prefill_engine_id"] == "omni-thinker-prefill"
 
     def test_extracts_bootstrap_addr_for_mooncake(self, monkeypatch):
         omni = _make_pd_omni(
@@ -1095,7 +1081,6 @@ class TestPDRouting:
         assert kv_params["do_remote_prefill"] is True
         assert kv_params["do_remote_decode"] is False
         assert kv_params["transfer_id"] == f"xfer-{expected_rid}"
-        assert kv_params["remote_engine_id"] == "omni-thinker-prefill"
         assert kv_params["remote_bootstrap_addr"] == "127.0.0.1:25201"
 
 
@@ -1266,11 +1251,11 @@ class TestMooncakeConnectorPatch:
         except ImportError:
             pytest.skip("vLLM MooncakeConnector not available in this env")
 
-        from vllm_omni.distributed.kv_transfer.mooncake_pd_adapter import (
-            create_patched_mooncake_connector,
+        from vllm_omni.distributed.kv_transfer.monkey_patch import (
+            _create_patched_mooncake_connector as create_patched_mooncake_connector,
         )
 
-        PatchedCls = create_patched_mooncake_connector(engine_id="test-engine")
+        PatchedCls = create_patched_mooncake_connector()
         assert issubclass(PatchedCls, OriginalMC)
 
     def test_request_finished_returns_remote_request_id(self):
@@ -1284,16 +1269,15 @@ class TestMooncakeConnectorPatch:
         except ImportError:
             pytest.skip("vLLM MooncakeConnector not available in this env")
 
-        from vllm_omni.distributed.kv_transfer.mooncake_pd_adapter import (
-            create_patched_mooncake_connector,
+        from vllm_omni.distributed.kv_transfer.monkey_patch import (
+            _create_patched_mooncake_connector as create_patched_mooncake_connector,
         )
 
-        PatchedCls = create_patched_mooncake_connector(engine_id="prefill-0")
+        PatchedCls = create_patched_mooncake_connector()
 
         # Create a mock instance without calling __init__ (avoids needing
         # real vLLM config), then manually set attributes the method needs.
         instance = PatchedCls.__new__(PatchedCls)
-        instance.engine_id = "prefill-0"
         instance.remote_to_local_req = {}
 
         # Mock request object
@@ -1328,15 +1312,14 @@ class TestMooncakeConnectorPatch:
         except ImportError:
             pytest.skip("vLLM MooncakeConnector not available in this env")
 
-        from vllm_omni.distributed.kv_transfer.mooncake_pd_adapter import (
+        from vllm_omni.distributed.kv_transfer.monkey_patch import (
             PatchedRecvReqMeta,
-            create_patched_mooncake_connector,
+            _create_patched_mooncake_connector as create_patched_mooncake_connector,
         )
 
-        PatchedCls = create_patched_mooncake_connector(engine_id="decode-0")
+        PatchedCls = create_patched_mooncake_connector()
 
         instance = PatchedCls.__new__(PatchedCls)
-        instance.engine_id = "decode-0"
         instance.remote_to_local_req = {}
         instance._reqs_need_recv = {}
 

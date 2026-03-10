@@ -18,9 +18,6 @@
 # performs only prompt processing + KV save, then the decode stage loads
 # the KV cache and generates the full response.
 #
-# engine_id values must be set explicitly so the orchestrator can tell the
-# decode engine where to pull KV from (the prefill engine's identity).
-#
 # IMPORTANT: MooncakeConnector does not support heterogeneous TP sizes.
 # Both prefill and decode stages MUST use the same tensor_parallel_size.
 # If the thinker model requires TP=2, set both stages to TP=2 and
@@ -62,7 +59,6 @@ stage_args:
         kv_role: "kv_producer"
         kv_rank: 0
         kv_parallel_size: 2
-        engine_id: "omni-thinker-prefill"
         kv_connector_extra_config:
           mooncake_bootstrap_port: 25201
     final_output: false
@@ -103,7 +99,6 @@ stage_args:
         kv_role: "kv_consumer"
         kv_rank: 1
         kv_parallel_size: 2
-        engine_id: "omni-thinker-decode"
         kv_connector_extra_config:
           mooncake_bootstrap_port: 25202
     engine_input_source: [0]

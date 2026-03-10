@@ -341,19 +341,7 @@ class AsyncOmni(OmniBase):
 
             # PD disaggregation: auto-duplicate thinker sampling params for
             # the decode stage when the caller provides N-1 params.
-            if self._pd_separation_pair is not None and len(sampling_params_list) == len(self.stage_list) - 1:
-                p_id, d_id = self._pd_separation_pair
-                sp_list = list(sampling_params_list)
-                sp_list.insert(d_id, sp_list[p_id])
-                sampling_params_list = sp_list
-                logger.warning(
-                    "[%s] PD mode: auto-duplicated thinker sampling params "
-                    "for decode stage %d. To suppress this warning, pass "
-                    "%d sampling params (one per physical stage).",
-                    self._name,
-                    d_id,
-                    len(self.stage_list),
-                )
+            sampling_params_list = self._maybe_expand_sampling_params(sampling_params_list)
 
             if len(sampling_params_list) != len(self.stage_list):
                 raise ValueError(f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}")
@@ -533,76 +521,19 @@ class AsyncOmni(OmniBase):
 
                 # PD disaggregation: route from prefill → decode with
                 # original prompt and decode-side kv_transfer_params.
-                is_pd_routing = self._pd_separation_pair is not None and self._pd_separation_pair == (
-                    stage_id,
-                    next_stage_id,
-                )
-
-                if is_pd_routing:
-                    # Trace prefill engine outputs for PD debugging
-                    for _eo in engine_outputs:
-                        _eo_kv = getattr(_eo, "kv_transfer_params", None)
-                        _eo_ntoks = (
-                            sum(len(o.token_ids) for o in _eo.outputs)
-                            if hasattr(_eo, "outputs") and _eo.outputs
-                            else "?"
-                        )
-                        logger.debug(
-                            "[%s][PD] Prefill stage-%d output for req %s: num_output_tokens=%s, kv_transfer_params=%s",
-                            self._name,
-                            stage_id,
-                            request_id,
-                            _eo_ntoks,
-                            _eo_kv,
-                        )
+                if self._is_pd_routing(stage_id, next_stage_id):
                     next_inputs = [prompt] if not isinstance(prompt, list) else prompt
                     sp_next = sampling_params_list[next_stage_id].clone()
                     if sp_next.extra_args is None:
                         sp_next.extra_args = {}
 
-                    # Merge order (matches sync path in omni.py):
-                    # 1. Start with role flags
-                    # 2. Merge user-provided params
-                    # 3. Merge config connector info
-                    # 4. Merge prefill output params
-                    # 5. Re-assert role flags
-                    decode_kv_params: dict[str, Any] = {
-                        "do_remote_decode": False,
-                        "do_remote_prefill": True,
-                        "transfer_id": f"xfer-{request_id}",
-                    }
-
-                    # Merge any user-provided decode-side kv_transfer_params
-                    # first (same semantics as the sync path in omni.py).
-                    existing_kv_params = self._normalize_kv_transfer_params(
-                        sp_next.extra_args.get("kv_transfer_params")
-                    )
-                    if existing_kv_params:
-                        decode_kv_params.update(existing_kv_params)
-
-                    # Add prefill engine connection info from config
-                    # (only fill in keys that aren't already present).
-                    if self._pd_connector_info:
-                        eid = self._pd_connector_info.get("prefill_engine_id")
-                        if eid is not None and "remote_engine_id" not in decode_kv_params:
-                            decode_kv_params["remote_engine_id"] = eid
-                        baddr = self._pd_connector_info.get("prefill_bootstrap_addr")
-                        if baddr is not None and "remote_bootstrap_addr" not in decode_kv_params:
-                            decode_kv_params["remote_bootstrap_addr"] = baddr
-
-                    kv_from_prefill = self._extract_kv_transfer_params(engine_outputs)
-                    if kv_from_prefill:
-                        decode_kv_params.update(kv_from_prefill)
-
-                    # Ensure the decode role flags are correct after merges
-                    decode_kv_params["do_remote_prefill"] = True
-                    decode_kv_params["do_remote_decode"] = False
+                    prefill_kv = self._extract_kv_transfer_params(engine_outputs)
+                    decode_kv_params = self._build_decode_kv_params(request_id, sp_next, prefill_kv)
 
                     sp_next.extra_args["kv_transfer_params"] = decode_kv_params
                     logger.debug(
                         "[%s] PD routing: stage-%d→stage-%d, req %s, "
-                        "remote_request_id=%s, remote=%s:%s, "
-                        "decode kv_transfer_params=%s",
+                        "remote_request_id=%s, remote=%s:%s",
                         self._name,
                         stage_id,
                         next_stage_id,
@@ -610,15 +541,11 @@ class AsyncOmni(OmniBase):
                         decode_kv_params.get("remote_request_id", "NOT SET"),
                         decode_kv_params.get("remote_host", "?"),
                         decode_kv_params.get("remote_port", "?"),
-                        decode_kv_params,
                     )
                     if "remote_request_id" not in decode_kv_params:
                         logger.warning(
                             "[%s] PD routing: remote_request_id NOT SET "
-                            "in decode_kv_params for req %s. The decode "
-                            "engine's MooncakeConnector will use its own "
-                            "request_id which differs from the prefill "
-                            "engine's — KV transfer will FAIL. Apply the "
+                            "in decode_kv_params for req %s. Apply the "
                             "mooncake_connector.py patch to fix this.",
                             self._name,
                             request_id,

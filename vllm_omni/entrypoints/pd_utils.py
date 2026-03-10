@@ -221,13 +221,12 @@ class PDDisaggregationMixin:
         if not kv_cfg_dict:
             return None
 
-        engine_id = kv_cfg_dict.get("engine_id")
         kv_connector = str(kv_cfg_dict.get("kv_connector", "") or "")
         extra_cfg = kv_cfg_dict.get("kv_connector_extra_config", {}) or {}
         if not isinstance(extra_cfg, dict):
             extra_cfg = self._kv_cfg_to_dict(extra_cfg)
 
-        info: dict[str, Any] = {"prefill_engine_id": engine_id}
+        info: dict[str, Any] = {}
 
         if "mooncake" in kv_connector.lower():
             bootstrap_port = extra_cfg.get("mooncake_bootstrap_port", None)
@@ -310,3 +309,79 @@ class PDDisaggregationMixin:
                 )
                 return self._normalize_kv_transfer_params(kv_params)
         return None
+
+    # ------------------------------------------------------------------
+    # Helpers used by both sync (omni.py) and async (async_omni.py) paths
+    # ------------------------------------------------------------------
+
+    def _is_pd_routing(self, stage_id: int, next_stage_id: int) -> bool:
+        """Return ``True`` when the edge *stage_id* → *next_stage_id*
+        is the prefill→decode boundary in a PD pipeline."""
+        return self._pd_separation_pair is not None and self._pd_separation_pair == (
+            stage_id,
+            next_stage_id,
+        )
+
+    def _maybe_expand_sampling_params(self, sampling_params_list: list) -> list:
+        """Auto-duplicate thinker sampling params for the decode stage.
+
+        When the user provides N-1 sampling params (one per *logical*
+        stage), expand the list to N by inserting a copy of the prefill
+        params at the decode position.  Returns the list unchanged when
+        no PD pair is detected or the list already has the right length.
+        """
+        if self._pd_separation_pair is None:
+            return sampling_params_list
+        if len(sampling_params_list) != len(self.stage_list) - 1:
+            return sampling_params_list
+        p_id, d_id = self._pd_separation_pair
+        sp_list = list(sampling_params_list)
+        sp_list.insert(d_id, sp_list[p_id])
+        return sp_list
+
+    def _build_decode_kv_params(
+        self,
+        req_id: str,
+        sp_next: "SamplingParams",
+        prefill_kv_params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build the decode-side ``kv_transfer_params`` dict.
+
+        Merge order (must be consistent across sync and async paths):
+            1. Start with role flags
+            2. Merge user-provided params from ``sp_next``
+            3. Merge config connector info (bootstrap addr)
+            4. Merge prefill output params (``prefill_kv_params``)
+            5. Re-assert role flags
+        """
+        decode_kv_params: dict[str, Any] = {
+            "do_remote_decode": False,
+            "do_remote_prefill": True,
+            "transfer_id": f"xfer-{req_id}",
+        }
+
+        # User-provided params
+        if sp_next.extra_args:
+            existing = self._normalize_kv_transfer_params(
+                sp_next.extra_args.get("kv_transfer_params")
+            )
+            if existing:
+                decode_kv_params.update(existing)
+
+        # Config connector info
+        if self._pd_connector_info:
+            baddr = self._pd_connector_info.get("prefill_bootstrap_addr")
+            if baddr is not None and "remote_bootstrap_addr" not in decode_kv_params:
+                decode_kv_params["remote_bootstrap_addr"] = baddr
+
+        # Prefill output params
+        if prefill_kv_params:
+            decode_kv_params.update(prefill_kv_params)
+
+        # Re-assert role flags
+        decode_kv_params["do_remote_prefill"] = True
+        decode_kv_params["do_remote_decode"] = False
+        if not decode_kv_params.get("transfer_id"):
+            decode_kv_params["transfer_id"] = f"xfer-{req_id}"
+
+        return decode_kv_params

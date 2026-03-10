@@ -1038,21 +1038,9 @@ class Omni(OmniBase):
         if sampling_params_list is None:
             raise ValueError("sampling_params_list is required for pipelined generation")
 
-        # PD disaggregation: the user provides sampling params for the
-        # *logical* stages (thinker, talker, code2wav) but the PD config
-        # splits thinker into two physical stages (prefill + decode).
-        # Auto-duplicate the thinker params for the decode stage so the
-        # caller doesn't need to know about the internal split.
-        if self._pd_separation_pair is not None and len(sampling_params_list) == len(self.stage_list) - 1:
-            p_id, d_id = self._pd_separation_pair
-            sp_list = list(sampling_params_list)
-            sp_list.insert(d_id, sp_list[p_id])
-            sampling_params_list = sp_list
-            logger.debug(
-                "[%s] PD mode: auto-duplicated thinker sampling params for decode stage %d",
-                self._name,
-                d_id,
-            )
+        # PD disaggregation: auto-duplicate thinker sampling params for
+        # the decode stage when the caller provides N-1 params.
+        sampling_params_list = self._maybe_expand_sampling_params(sampling_params_list)
 
         if len(sampling_params_list) != len(self.stage_list):
             raise ValueError(f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}")
@@ -1280,12 +1268,7 @@ class Omni(OmniBase):
                     # PD disaggregation: when routing from prefill to decode,
                     # re-submit the original prompt so the decode engine can
                     # load the prefilled KV cache via vLLM's native connector.
-                    is_pd_routing = self._pd_separation_pair is not None and self._pd_separation_pair == (
-                        stage_id,
-                        next_stage_id,
-                    )
-
-                    if is_pd_routing:
+                    if self._is_pd_routing(stage_id, next_stage_id):
                         # Use the original prompt as decode engine input
                         original_prompt = request_id_to_prompt[req_id]
                         next_inputs = [original_prompt] if not isinstance(original_prompt, list) else original_prompt
@@ -1295,42 +1278,8 @@ class Omni(OmniBase):
                         if sp_next.extra_args is None:
                             sp_next.extra_args = {}
 
-                        # Build decode-side kv_transfer_params.  The decode
-                        # engine needs ``do_remote_prefill=True`` so the KV
-                        # connector loads the remotely prefilled KV cache.
-                        decode_kv_params: dict[str, Any] = {
-                            "do_remote_decode": False,
-                            "do_remote_prefill": True,
-                            "transfer_id": f"xfer-{req_id}",
-                        }
-
-                        # Merge any user-provided kv_transfer_params first
-                        existing_kv_params = self._normalize_kv_transfer_params(
-                            sp_next.extra_args.get("kv_transfer_params")
-                        )
-                        if existing_kv_params:
-                            decode_kv_params.update(existing_kv_params)
-
-                        # Add prefill engine connection info from config (if missing)
-                        if self._pd_connector_info:
-                            eid = self._pd_connector_info.get("prefill_engine_id")
-                            if eid is not None and "remote_engine_id" not in decode_kv_params:
-                                decode_kv_params["remote_engine_id"] = eid
-                            baddr = self._pd_connector_info.get("prefill_bootstrap_addr")
-                            if baddr is not None and "remote_bootstrap_addr" not in decode_kv_params:
-                                decode_kv_params["remote_bootstrap_addr"] = baddr
-
-                        # If the prefill output carried connector metadata,
-                        # merge it in (some connectors return additional info).
-                        kv_params_from_output = self._pop_pd_kv_params(req_id, result.get("kv_transfer_params"))
-                        if kv_params_from_output:
-                            decode_kv_params.update(kv_params_from_output)
-
-                        # Ensure the decode role flags are correct
-                        decode_kv_params["do_remote_prefill"] = True
-                        decode_kv_params["do_remote_decode"] = False
-                        if not decode_kv_params.get("transfer_id"):
-                            decode_kv_params["transfer_id"] = f"xfer-{req_id}"
+                        prefill_kv = self._pop_pd_kv_params(req_id, result.get("kv_transfer_params"))
+                        decode_kv_params = self._build_decode_kv_params(req_id, sp_next, prefill_kv)
 
                         sp_next.extra_args["kv_transfer_params"] = decode_kv_params
                         logger.info(

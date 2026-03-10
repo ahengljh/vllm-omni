@@ -1,27 +1,32 @@
-"""Patched MooncakeConnector that threads ``remote_request_id`` through
-KV transfer params so the decode engine can look up the KV cache stored
-by the prefill engine under its (different) internal request ID.
+"""Monkey-patch vLLM's ``MooncakeConnector`` to fix request-ID mismatch
+in prefill-decode disaggregation.
+
+vLLM's ``InputProcessor.assign_request_id()`` appends a random suffix to
+each request ID.  The prefill engine stores KV under its own suffix, but
+the decode engine generates a *different* suffix — so it can never find
+the KV data.  This module provides a patched connector that threads
+``remote_request_id`` through ``kv_transfer_params`` so the decode side
+can reference the correct KV entry.
 
 Usage::
 
-    from vllm_omni.distributed.kv_transfer.mooncake_pd_adapter import (
-        create_patched_mooncake_connector,
+    from vllm_omni.distributed.kv_transfer.monkey_patch import (
+        apply_mooncake_connector_patch,
     )
 
-    PatchedCls = create_patched_mooncake_connector(engine_id="my-engine")
-    # PatchedCls is a subclass of vLLM's MooncakeConnector
+    apply_mooncake_connector_patch()
 """
 
 from __future__ import annotations
 
 import logging
+import sys
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
-if TYPE_CHECKING:
-    pass
+_patched: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -42,21 +47,37 @@ class PatchedRecvReqMeta:
 
 
 # ---------------------------------------------------------------------------
-# Factory
+# Import helper
 # ---------------------------------------------------------------------------
 
 
-def create_patched_mooncake_connector(engine_id: str | None = None):
+def _import_mooncake_module():
+    """Import MooncakeConnector module, supporting both vLLM >=0.16 and older."""
+    try:
+        from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import mooncake_connector
+
+        return mooncake_connector
+    except ImportError:
+        pass
+    try:
+        from vllm.distributed.kv_transfer.kv_connector.v1 import mooncake_connector
+
+        return mooncake_connector
+    except ImportError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Patched connector factory
+# ---------------------------------------------------------------------------
+
+
+def _create_patched_mooncake_connector():
     """Return a *subclass* of vLLM's ``MooncakeConnector`` with
     ``remote_request_id`` support baked in.
 
     The import is lazy so this module can be safely imported even when
     vLLM is not installed (e.g. during linting / light tests).
-
-    Parameters
-    ----------
-    engine_id:
-        Optional identifier for this engine instance (for logging).
 
     Returns
     -------
@@ -95,13 +116,9 @@ def create_patched_mooncake_connector(engine_id: str | None = None):
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
-            self.engine_id: str | None = engine_id
-            # remote_request_id → local_request_id mapping for in-flight pulls
+            # remote_request_id -> local_request_id mapping for in-flight pulls
             self.remote_to_local_req: dict[str, str] = {}
-            logger.info(
-                "[PatchedMooncakeConnector] Initialized (engine_id=%s)",
-                self.engine_id,
-            )
+            logger.info("[PatchedMooncakeConnector] Initialized")
 
         # ---- prefill side: inject remote_request_id into output ----
 
@@ -145,10 +162,9 @@ def create_patched_mooncake_connector(engine_id: str | None = None):
                 if hasattr(self, "side_channel_port"):
                     kv_params.setdefault("remote_port", self.side_channel_port)
                 logger.debug(
-                    "[PatchedMooncakeConnector] request_finished: req_id=%s remote_request_id=%s engine_id=%s",
+                    "[PatchedMooncakeConnector] request_finished: req_id=%s remote_request_id=%s",
                     req_id,
                     kv_params.get("remote_request_id"),
-                    self.engine_id,
                 )
 
             return delay_free, kv_params
@@ -198,10 +214,9 @@ def create_patched_mooncake_connector(engine_id: str | None = None):
                     self._reqs_need_recv = {}
                 self._reqs_need_recv[request_id] = meta
                 logger.debug(
-                    "[PatchedMooncakeConnector] add_new_req (recv): local_id=%s remote_id=%s engine_id=%s",
+                    "[PatchedMooncakeConnector] add_new_req (recv): local_id=%s remote_id=%s",
                     request_id,
                     remote_request_id,
-                    self.engine_id,
                 )
 
         def group_kv_pull(self, metadata: Any | None = None) -> None:
@@ -261,7 +276,7 @@ def create_patched_mooncake_connector(engine_id: str | None = None):
             """
             result = super().receive_kv(path, req_blocks)
 
-            # Clean up any completed remote→local mappings
+            # Clean up any completed remote->local mappings
             if self.remote_to_local_req:
                 completed = []
                 for remote_id, local_id in self.remote_to_local_req.items():
@@ -281,3 +296,33 @@ def create_patched_mooncake_connector(engine_id: str | None = None):
     PatchedMooncakeConnector.__qualname__ = _OriginalMooncakeConnector.__qualname__
 
     return PatchedMooncakeConnector
+
+
+# ---------------------------------------------------------------------------
+# Public API: apply the monkey-patch
+# ---------------------------------------------------------------------------
+
+
+def apply_mooncake_connector_patch() -> bool:
+    """Replace vLLM's ``MooncakeConnector`` with the patched version."""
+    global _patched
+    if _patched:
+        return True
+
+    _mc_module = _import_mooncake_module()
+    if _mc_module is None:
+        logger.warning("[monkey_patch] Cannot import vLLM MooncakeConnector — patch NOT applied.")
+        return False
+
+    _OriginalClass = _mc_module.MooncakeConnector
+
+    PatchedClass = _create_patched_mooncake_connector()
+
+    _mc_module.MooncakeConnector = PatchedClass
+    for _, module in sys.modules.items():
+        if hasattr(module, "MooncakeConnector") and module.MooncakeConnector is _OriginalClass:
+            module.MooncakeConnector = PatchedClass
+
+    _patched = True
+    logger.info("[monkey_patch] MooncakeConnector patch applied")
+    return True

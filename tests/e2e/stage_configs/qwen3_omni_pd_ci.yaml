@@ -38,7 +38,6 @@ stage_args:
         kv_role: "kv_producer"
         kv_rank: 0
         kv_parallel_size: 2
-        engine_id: "omni-thinker-prefill"
         kv_connector_extra_config:
           mooncake_bootstrap_port: 25201
     final_output: false
@@ -79,7 +78,6 @@ stage_args:
         kv_role: "kv_consumer"
         kv_rank: 1
         kv_parallel_size: 2
-        engine_id: "omni-thinker-decode"
         kv_connector_extra_config:
           mooncake_bootstrap_port: 25202
     engine_input_source: [0]
