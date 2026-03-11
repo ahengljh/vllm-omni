@@ -444,14 +444,14 @@ def talker2code2wav(
         # Extract codec codes from talker output
         # Expected shape: [8, seq_len] (8-layer RVQ codes)
         codec_codes = (
-            output.multimodal_output["code_predictor_codes"][-seq_len:]
+            output.multimodal_output["code_predictor_codes"][:, -seq_len:]
             .to(torch.long)
             .transpose(0, 1)
             .cpu()
             .to(torch.long)
             .reshape(-1)
             .tolist()
-        )  # 16, seq_len
+        )  # [num_quantizers, seq_len] -> [seq_len, num_quantizers] -> flat
         code2wav_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=codec_codes,

@@ -861,7 +861,7 @@ class TestTalker2Code2Wav:
         The talker produces token_ids of length seq_len+1 (including a
         start/padding token), and codec codes of shape
         [num_quantizers, seq_len+1].  talker2code2wav slices the last
-        seq_len columns via ``codes[-seq_len:]``.
+        seq_len columns via ``codes[:, -seq_len:]``.
         """
         codec_codes = torch.randint(0, 1024, (num_quantizers, seq_len + 1))
         mm_output = {"code_predictor_codes": codec_codes}
@@ -909,9 +909,9 @@ class TestTalker2Code2Wav:
         results = talker2code2wav(stage_list, engine_input_source=[1])
         result_codes = results[0]["prompt_token_ids"]
 
-        # Manually compute expected: codes[-seq_len:].transpose(0,1).reshape(-1)
+        # Manually compute expected: codes[:, -seq_len:].transpose(0,1).reshape(-1)
         original_codes = talker_out.outputs[0].multimodal_output["code_predictor_codes"]
-        expected = original_codes[-seq_len:].to(torch.long).transpose(0, 1).reshape(-1).tolist()
+        expected = original_codes[:, -seq_len:].to(torch.long).transpose(0, 1).reshape(-1).tolist()
         assert result_codes == expected
 
     def test_codes_are_all_ints(self):
@@ -1187,7 +1187,7 @@ class TestTalker2Code2WavAsyncChunk:
         req = self._make_request(is_finished=True)
 
         codes = torch.randint(1, 100, (8, 5))
-        result = chunk_fn(mgr, {"code_predictor_codes": codes}, req)
+        result = chunk_fn(mgr, {"code_predictor_codes": codes}, req, is_finished=True)
 
         assert result is not None
         assert "code_predictor_codes" in result
@@ -1257,7 +1257,7 @@ class TestThinker2TalkerAsyncChunk:
             "tts_pad_embed": _rand(1),
         }
 
-        result = chunk_fn(mgr, pooling_output, req)
+        result = chunk_fn(mgr, pooling_output, req, is_finished=True)
 
         assert result is not None
         assert "thinker_prefill_embeddings" in result
@@ -1333,7 +1333,7 @@ class TestThinker2TalkerAsyncChunk:
             "tts_pad_embed": _rand(1),
         }
 
-        result = chunk_fn(mgr, pooling_output, req)
+        result = chunk_fn(mgr, pooling_output, req, is_finished=True)
         assert result["thinker_sequences"] == [10, 20, 30, 40, 50]
 
 
