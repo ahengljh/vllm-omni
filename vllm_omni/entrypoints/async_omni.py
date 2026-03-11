@@ -514,33 +514,12 @@ class AsyncOmni(OmniBase):
                 next_stage: OmniStage = self.stage_list[next_stage_id]
 
                 if self._is_pd_routing(stage_id, next_stage_id):
-                    next_inputs = [prompt] if not isinstance(prompt, list) else prompt
-                    sp_next = sampling_params_list[next_stage_id].clone()
-                    if sp_next.extra_args is None:
-                        sp_next.extra_args = {}
-
-                    prefill_kv = self._extract_kv_transfer_params(engine_outputs)
-                    decode_kv_params = self._build_decode_kv_params(request_id, sp_next, prefill_kv)
-
-                    sp_next.extra_args["kv_transfer_params"] = decode_kv_params
-                    logger.debug(
-                        "[%s] PD routing: stage-%d→stage-%d, req %s, remote_request_id=%s, remote=%s:%s",
-                        self._name,
-                        stage_id,
-                        next_stage_id,
+                    next_inputs, sp_next = self._prepare_pd_decode_routing(
                         request_id,
-                        decode_kv_params.get("remote_request_id", "NOT SET"),
-                        decode_kv_params.get("remote_host", "?"),
-                        decode_kv_params.get("remote_port", "?"),
+                        prompt,
+                        sampling_params_list[next_stage_id],
+                        engine_outputs=engine_outputs,
                     )
-                    if "remote_request_id" not in decode_kv_params:
-                        logger.warning(
-                            "[%s] PD routing: remote_request_id NOT SET "
-                            "in decode_kv_params for req %s. Apply the "
-                            "mooncake_connector.py patch to fix this.",
-                            self._name,
-                            request_id,
-                        )
                 else:
                     # Derive inputs for the next stage, record postprocess time
                     with metrics.stage_postprocess_timer(stage_id, request_id):

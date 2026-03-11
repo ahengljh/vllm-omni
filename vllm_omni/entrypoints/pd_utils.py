@@ -293,3 +293,46 @@ class PDDisaggregationMixin:
             decode_kv_params["transfer_id"] = f"xfer-{req_id}"
 
         return decode_kv_params
+
+    def _prepare_pd_decode_routing(
+        self,
+        req_id: str,
+        prompt: Any,
+        sp_template: "SamplingParams",
+        prefill_kv_fallback: Any | None = None,
+        engine_outputs: Any | None = None,
+    ) -> tuple[list, "SamplingParams"]:
+        """Prepare next_inputs and sampling params for prefill→decode routing.
+
+        Used by both sync (omni.py) and async (async_omni.py) paths.
+
+        Returns:
+            (next_inputs, sp_next) ready to submit to the decode stage.
+        """
+        next_inputs = [prompt] if not isinstance(prompt, list) else prompt
+
+        sp_next = sp_template.clone()
+        if sp_next.extra_args is None:
+            sp_next.extra_args = {}
+
+        if engine_outputs is not None:
+            prefill_kv = self._extract_kv_transfer_params(engine_outputs)
+        else:
+            prefill_kv = self._pop_pd_kv_params(req_id, prefill_kv_fallback)
+
+        decode_kv_params = self._build_decode_kv_params(req_id, sp_next, prefill_kv)
+        sp_next.extra_args["kv_transfer_params"] = decode_kv_params
+
+        logger.debug(
+            "[PD] routing req=%s, remote_request_id=%s",
+            req_id,
+            decode_kv_params.get("remote_request_id", "NOT SET"),
+        )
+        if "remote_request_id" not in decode_kv_params:
+            logger.warning(
+                "[PD] remote_request_id NOT SET for req %s. "
+                "Apply mooncake_connector.py patch to fix.",
+                req_id,
+            )
+
+        return next_inputs, sp_next

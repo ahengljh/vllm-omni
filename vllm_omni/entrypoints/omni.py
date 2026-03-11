@@ -1343,36 +1343,12 @@ class Omni(OmniBase):
                     next_stage: OmniStage = self.stage_list[next_stage_id]
 
                     if self._is_pd_routing(stage_id, next_stage_id):
-                        original_prompt = request_id_to_prompt[req_id]
-                        next_inputs = [original_prompt] if not isinstance(original_prompt, list) else original_prompt
-
-                        sp_next = sampling_params_list[next_stage_id]  # type: ignore[index]
-                        sp_next = sp_next.clone()
-                        if sp_next.extra_args is None:
-                            sp_next.extra_args = {}
-
-                        prefill_kv = self._pop_pd_kv_params(req_id, result.get("kv_transfer_params"))
-                        decode_kv_params = self._build_decode_kv_params(req_id, sp_next, prefill_kv)
-
-                        sp_next.extra_args["kv_transfer_params"] = decode_kv_params
-                        logger.info(
-                            "[%s] PD routing: stage-%d→stage-%d, req %s, remote_request_id=%s, remote=%s:%s",
-                            self._name,
-                            stage_id,
-                            next_stage_id,
+                        next_inputs, sp_next = self._prepare_pd_decode_routing(
                             req_id,
-                            decode_kv_params.get("remote_request_id", "NOT SET"),
-                            decode_kv_params.get("remote_host", "?"),
-                            decode_kv_params.get("remote_port", "?"),
+                            request_id_to_prompt[req_id],
+                            sampling_params_list[next_stage_id],
+                            prefill_kv_fallback=result.get("kv_transfer_params"),
                         )
-                        if "remote_request_id" not in decode_kv_params:
-                            logger.warning(
-                                "[%s] PD routing: remote_request_id NOT SET "
-                                "in decode_kv_params for req %s. Apply the "
-                                "mooncake_connector.py patch to fix this.",
-                                self._name,
-                                req_id,
-                            )
                     else:
                         try:
                             # Derive inputs for the next stage, record preprocess time
