@@ -1147,12 +1147,12 @@ class TestKVParamsCleanup:
 
 class TestPDYAMLConfig:
     def test_pd_yaml_loads(self):
-        """The PD separation YAML config should load without errors."""
+        """The PD multiconnector YAML config should load without errors."""
         import os
 
         yaml_path = os.path.join(
             os.path.dirname(__file__),
-            "../../vllm_omni/model_executor/stage_configs/qwen3_omni_moe_pd_separation.yaml",
+            "../../vllm_omni/model_executor/stage_configs/qwen3_omni_moe_pd_multiconnector.yaml",
         )
         yaml_path = os.path.abspath(yaml_path)
         if not os.path.exists(yaml_path):
