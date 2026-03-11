@@ -1,20 +1,9 @@
-"""Monkey-patch vLLM's ``MooncakeConnector`` to fix request-ID mismatch
-in prefill-decode disaggregation.
+"""Monkey-patch vLLM's MooncakeConnector to fix request-ID mismatch in PD disaggregation.
 
-vLLM's ``InputProcessor.assign_request_id()`` appends a random suffix to
-each request ID.  The prefill engine stores KV under its own suffix, but
-the decode engine generates a *different* suffix — so it can never find
-the KV data.  This module provides a patched connector that threads
-``remote_request_id`` through ``kv_transfer_params`` so the decode side
-can reference the correct KV entry.
-
-Usage::
-
-    from vllm_omni.distributed.kv_transfer.monkey_patch import (
-        apply_mooncake_connector_patch,
-    )
-
-    apply_mooncake_connector_patch()
+vLLM's InputProcessor appends a random suffix to each request ID. The prefill
+engine stores KV under its suffix, but the decode engine generates a different
+suffix. This patch threads ``remote_request_id`` through ``kv_transfer_params``
+so the decode side references the correct KV entry.
 """
 
 from __future__ import annotations
@@ -29,26 +18,14 @@ logger = logging.getLogger(__name__)
 _patched: bool = False
 
 
-# ---------------------------------------------------------------------------
-# Patched metadata dataclass
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class PatchedRecvReqMeta:
-    """Extended receive-request metadata that carries the prefill engine's
-    internal request ID (``remote_request_id``) alongside the local one.
-    """
+    """Receive-request metadata carrying the prefill engine's request ID."""
 
     request_id: str
     remote_request_id: str
     local_block_ids: list[int]
     kv_transfer_params: dict[str, Any]
-
-
-# ---------------------------------------------------------------------------
-# Import helper
-# ---------------------------------------------------------------------------
 
 
 def _import_mooncake_module():
@@ -67,26 +44,8 @@ def _import_mooncake_module():
         return None
 
 
-# ---------------------------------------------------------------------------
-# Patched connector factory
-# ---------------------------------------------------------------------------
-
-
 def _create_patched_mooncake_connector():
-    """Return a *subclass* of vLLM's ``MooncakeConnector`` with
-    ``remote_request_id`` support baked in.
-
-    The import is lazy so this module can be safely imported even when
-    vLLM is not installed (e.g. during linting / light tests).
-
-    Returns
-    -------
-    type
-        A class that is a proper subclass of
-        ``vllm...v1.mooncake.mooncake_connector.MooncakeConnector``.
-    """
-    # Lazy import — the GPU environment has vLLM; CI / linting may not.
-    # Support both vLLM >=0.16 (mooncake subpackage) and older layouts.
+    """Return a subclass of MooncakeConnector with remote_request_id support."""
     try:
         from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
             MooncakeConnector as _OriginalMooncakeConnector,
@@ -97,79 +56,44 @@ def _create_patched_mooncake_connector():
         )
 
     class PatchedMooncakeConnector(_OriginalMooncakeConnector):
-        """MooncakeConnector subclass that fixes the request-ID mismatch
-        in prefill-decode disaggregation.
-
-        Key changes
-        -----------
-        * ``request_finished`` injects ``remote_request_id`` (the prefill
-          engine's internal request ID) into ``kv_transfer_params`` so the
-          orchestrator can forward it to the decode engine.
-        * ``add_new_req`` uses ``remote_request_id`` from
-          ``kv_transfer_params`` when ``load_remote_cache=True``, creating a
-          ``PatchedRecvReqMeta`` instead of the default ``RecvReqMeta``.
-        * ``group_kv_pull`` sends ZMQ requests using
-          ``meta.remote_request_id``.
-        * ``receive_kv`` maps the remote ID back to the local ID after
-          transfer.
+        """Fixes request-ID mismatch in PD disaggregation by injecting
+        remote_request_id on the prefill side and using it for KV lookup
+        on the decode side.
         """
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
-            # remote_request_id -> local_request_id mapping for in-flight pulls
             self.remote_to_local_req: dict[str, str] = {}
             logger.info("[PatchedMooncakeConnector] Initialized")
-
-        # ---- prefill side: inject remote_request_id into output ----
 
         def request_finished(
             self,
             request: Any,
             block_ids: list[int],
         ) -> tuple[bool, dict[str, Any] | None]:
-            """Call the original ``request_finished``, then inject
-            ``remote_request_id`` into the returned kv_transfer_params.
-
-            Return type matches upstream vLLM 0.16:
-                ``(delay_free_blocks: bool, kv_transfer_params: dict | None)``
-
-            The original implementation may store the request in
-            ``_reqs_need_send`` as a ``(Request, list[int])`` tuple; we also
-            normalise that to just ``list[int]`` to prevent downstream
-            serialisation issues.
-            """
             result = super().request_finished(request, block_ids)
 
-            # Unpack upstream return value: (bool, dict | None)
             if isinstance(result, tuple) and len(result) == 2:
                 delay_free, kv_params = result
             else:
-                # Fallback for older vLLM versions that may return differently
                 delay_free, kv_params = False, result
 
-            # --- normalise _reqs_need_send values -----------------------
+            # Normalise _reqs_need_send values
             req_id = getattr(request, "request_id", None)
             if req_id and hasattr(self, "_reqs_need_send"):
                 entry = self._reqs_need_send.get(req_id)
                 if isinstance(entry, tuple) and len(entry) == 2:
                     self._reqs_need_send[req_id] = entry[1]
 
-            # --- inject remote_request_id into kv_transfer_params -------
+            # Inject remote_request_id into kv_transfer_params
             if kv_params is not None and isinstance(kv_params, dict):
                 kv_params["remote_request_id"] = req_id or "NOT_SET"
                 if hasattr(self, "side_channel_host"):
                     kv_params.setdefault("remote_host", self.side_channel_host)
                 if hasattr(self, "side_channel_port"):
                     kv_params.setdefault("remote_port", self.side_channel_port)
-                logger.debug(
-                    "[PatchedMooncakeConnector] request_finished: req_id=%s remote_request_id=%s",
-                    req_id,
-                    kv_params.get("remote_request_id"),
-                )
 
             return delay_free, kv_params
-
-        # ---- decode side: use remote_request_id for look-up ----
 
         def add_new_req(
             self,
@@ -178,21 +102,7 @@ def _create_patched_mooncake_connector():
             kv_transfer_params: dict[str, Any] | None = None,
             **kwargs: Any,
         ) -> None:
-            """Call ``super().add_new_req()`` for all requests, then layer
-            PD-specific ``PatchedRecvReqMeta`` on top for decode-side
-            (``load_remote_cache=True``) requests.
-
-            This ensures any future logic added to the base method is
-            always executed, while still providing the
-            ``remote_request_id`` mapping needed for PD disaggregation.
-            """
-            # Always call super() so base-class bookkeeping is preserved.
-            super().add_new_req(
-                request_id,
-                local_block_ids,
-                kv_transfer_params,
-                **kwargs,
-            )
+            super().add_new_req(request_id, local_block_ids, kv_transfer_params, **kwargs)
 
             kv_transfer_params = kv_transfer_params or {}
             load_remote_cache = kv_transfer_params.get(
@@ -208,32 +118,15 @@ def _create_patched_mooncake_connector():
                     local_block_ids=local_block_ids,
                     kv_transfer_params=kv_transfer_params,
                 )
-                # Override the entry created by super() with our patched
-                # version that carries remote_request_id.
                 if not hasattr(self, "_reqs_need_recv"):
                     self._reqs_need_recv = {}
                 self._reqs_need_recv[request_id] = meta
-                logger.debug(
-                    "[PatchedMooncakeConnector] add_new_req (recv): local_id=%s remote_id=%s",
-                    request_id,
-                    remote_request_id,
-                )
 
         def group_kv_pull(self, metadata: Any | None = None) -> None:
-            """Override to use ``meta.remote_request_id`` as the ZMQ look-up
-            key instead of the local request ID.
-
-            We use a *save-patch-restore* pattern: save the original
-            ``_reqs_need_recv``, replace it with a re-keyed copy (using
-            remote IDs), call ``super().group_kv_pull()`` which reads
-            from ``self._reqs_need_recv`` directly (so we can't use a
-            copy-and-return approach), then restore unconsumed entries
-            to their original local keys.
-            """
+            """Use remote_request_id as ZMQ lookup key via save-patch-restore."""
             if not hasattr(self, "_reqs_need_recv") or not self._reqs_need_recv:
                 return
 
-            # Build a patched copy; keep the original for restoration.
             original_recv = self._reqs_need_recv.copy()
             patched_recv: dict[str, Any] = {}
 
@@ -241,13 +134,6 @@ def _create_patched_mooncake_connector():
                 if isinstance(meta, PatchedRecvReqMeta):
                     remote_id = meta.remote_request_id
                     self.remote_to_local_req[remote_id] = local_id
-                    logger.debug(
-                        "[PatchedMooncakeConnector] group_kv_pull: remote_id=%s -> local_id=%s",
-                        remote_id,
-                        local_id,
-                    )
-                    # Use remote_id as key so the base class ZMQ logic
-                    # looks up KV under the prefill engine's request ID.
                     patched_meta = type(meta)(
                         request_id=remote_id,
                         remote_request_id=remote_id,
@@ -258,60 +144,43 @@ def _create_patched_mooncake_connector():
                 else:
                     patched_recv[local_id] = meta
 
-            # Swap in the patched dict, delegate to the base class, then
-            # restore entries that weren't consumed.
             self._reqs_need_recv = patched_recv
             super().group_kv_pull(metadata)
 
-            # Restore any entries that the base class didn't consume
-            # (e.g. still pending transfer) back to their original keys.
+            # Restore unconsumed entries to original local keys
             for remote_id, local_id in list(self.remote_to_local_req.items()):
                 if remote_id in self._reqs_need_recv:
                     entry = self._reqs_need_recv.pop(remote_id)
                     self._reqs_need_recv[local_id] = original_recv.get(local_id, entry)
 
         def receive_kv(self, path: Any = None, req_blocks: Any = None) -> Any:
-            """After the base class completes the ZMQ transfer, map
-            ``remote_id`` back to ``local_id`` in any result structures.
-            """
             result = super().receive_kv(path, req_blocks)
 
-            # Clean up any completed remote->local mappings
             if self.remote_to_local_req:
-                completed = []
-                for remote_id, local_id in self.remote_to_local_req.items():
-                    if not hasattr(self, "_reqs_need_recv") or local_id not in self._reqs_need_recv:
-                        completed.append(remote_id)
+                completed = [
+                    rid
+                    for rid, lid in self.remote_to_local_req.items()
+                    if not hasattr(self, "_reqs_need_recv") or lid not in self._reqs_need_recv
+                ]
                 for remote_id in completed:
-                    popped_local = self.remote_to_local_req.pop(remote_id, None)
-                    logger.debug(
-                        "[PatchedMooncakeConnector] receive_kv done: remote_id=%s -> local_id=%s",
-                        remote_id,
-                        popped_local,
-                    )
+                    self.remote_to_local_req.pop(remote_id, None)
 
             return result
 
-    # Preserve the original qualname for isinstance checks in vLLM
     PatchedMooncakeConnector.__qualname__ = _OriginalMooncakeConnector.__qualname__
 
     return PatchedMooncakeConnector
 
 
-# ---------------------------------------------------------------------------
-# Public API: apply the monkey-patch
-# ---------------------------------------------------------------------------
-
-
 def apply_mooncake_connector_patch() -> bool:
-    """Replace vLLM's ``MooncakeConnector`` with the patched version."""
+    """Replace vLLM's MooncakeConnector with the patched version."""
     global _patched
     if _patched:
         return True
 
     _mc_module = _import_mooncake_module()
     if _mc_module is None:
-        logger.warning("[monkey_patch] Cannot import vLLM MooncakeConnector — patch NOT applied.")
+        logger.warning("[monkey_patch] Cannot import MooncakeConnector — patch NOT applied.")
         return False
 
     _OriginalClass = _mc_module.MooncakeConnector

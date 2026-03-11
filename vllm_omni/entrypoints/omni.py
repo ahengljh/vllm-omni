@@ -193,7 +193,6 @@ class OmniBase(PDDisaggregationMixin):
         logger.info(f"Initializing stages for model: {model}")
         self._initialize_stages(model, kwargs)
 
-        # PD disaggregation: detect prefill-decode stage pair
         self._init_pd_state()
 
     def _get_default_cache_config(self, cache_backend: str | None) -> dict[str, Any] | None:
@@ -1038,8 +1037,6 @@ class Omni(OmniBase):
         if sampling_params_list is None:
             raise ValueError("sampling_params_list is required for pipelined generation")
 
-        # PD disaggregation: auto-duplicate thinker sampling params for
-        # the decode stage when the caller provides N-1 params.
         sampling_params_list = self._maybe_expand_sampling_params(sampling_params_list)
 
         if len(sampling_params_list) != len(self.stage_list):
@@ -1100,16 +1097,12 @@ class Omni(OmniBase):
         # Mark first input time for stage-0
         metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
 
-        # Check if stage 0 is the prefill-only stage in a PD pair
         _seed_is_prefill = self._pd_separation_pair is not None and self._pd_separation_pair[0] == 0
 
         for req_id, prompt in request_id_to_prompt.items():
             sp0 = sampling_params_list[0]  # type: ignore[index]
 
             if _seed_is_prefill:
-                # PD disaggregation: prefill-only stage generates a single
-                # token so vLLM's KV connector saves the KV cache.
-                # Aligned with vLLM's disaggregated serving proxy pattern.
                 sp0 = self._prepare_prefill_sampling_params(req_id, sp0)
 
             task = {
@@ -1164,8 +1157,6 @@ class Omni(OmniBase):
 
                 engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
 
-                # PD: extract kv_transfer_params from prefill engine outputs
-                # (must happen after _load so shared memory is read only once).
                 if (
                     self._pd_separation_pair is not None
                     and req_id is not None
@@ -1265,11 +1256,7 @@ class Omni(OmniBase):
                 if next_stage_id <= final_stage_id_to_prompt[req_id]:
                     next_stage: OmniStage = self.stage_list[next_stage_id]
 
-                    # PD disaggregation: when routing from prefill to decode,
-                    # re-submit the original prompt so the decode engine can
-                    # load the prefilled KV cache via vLLM's native connector.
                     if self._is_pd_routing(stage_id, next_stage_id):
-                        # Use the original prompt as decode engine input
                         original_prompt = request_id_to_prompt[req_id]
                         next_inputs = [original_prompt] if not isinstance(original_prompt, list) else original_prompt
 
@@ -1315,8 +1302,6 @@ class Omni(OmniBase):
                             continue
                         sp_next = sampling_params_list[next_stage_id]  # type: ignore[index]
 
-                    # If we are about to enter the prefill stage (when it is not stage-0),
-                    # apply prefill-only sampling params.
                     if self._pd_separation_pair is not None and next_stage_id == self._pd_separation_pair[0]:
                         sp_next = self._prepare_prefill_sampling_params(req_id, sp_next)
 
@@ -1365,8 +1350,6 @@ class Omni(OmniBase):
         if pbar:
             pbar.close()
 
-        # Defense-in-depth: drop any leftover PD KV params for this batch
-        # in case error/completion paths missed a cleanup.
         for rid in request_ids:
             self._drop_pd_kv_params(rid)
 

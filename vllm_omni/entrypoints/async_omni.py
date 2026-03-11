@@ -339,8 +339,6 @@ class AsyncOmni(OmniBase):
             if sampling_params_list is None:
                 sampling_params_list = self.default_sampling_params_list
 
-            # PD disaggregation: auto-duplicate thinker sampling params for
-            # the decode stage when the caller provides N-1 params.
             sampling_params_list = self._maybe_expand_sampling_params(sampling_params_list)
 
             if len(sampling_params_list) != len(self.stage_list):
@@ -371,8 +369,6 @@ class AsyncOmni(OmniBase):
             self.request_states[request_id] = req_state
             sp0: SamplingParams = sampling_params_list[0]  # type: ignore[index]
 
-            # PD disaggregation: prepare prefill-only sampling params for
-            # stage-0 (max_tokens=1, do_remote_decode=True).
             if self._pd_separation_pair is not None and self._pd_separation_pair[0] == 0:
                 sp0 = self._prepare_prefill_sampling_params(request_id, sp0)
                 logger.info(
@@ -389,8 +385,6 @@ class AsyncOmni(OmniBase):
                 "engine_inputs": prompt,
                 "sampling_params": sp0,
             }
-            # PD: store kv_transfer_params as top-level backup in task dict
-            # to survive any potential msgspec.Struct pickle serialization issues
             if sp0.extra_args and "kv_transfer_params" in sp0.extra_args:
                 task["_kv_transfer_params"] = sp0.extra_args["kv_transfer_params"]
             self.stage_list[0].submit(task)
@@ -519,8 +513,6 @@ class AsyncOmni(OmniBase):
             if next_stage_id <= final_stage_id_for_e2e:
                 next_stage: OmniStage = self.stage_list[next_stage_id]
 
-                # PD disaggregation: route from prefill → decode with
-                # original prompt and decode-side kv_transfer_params.
                 if self._is_pd_routing(stage_id, next_stage_id):
                     next_inputs = [prompt] if not isinstance(prompt, list) else prompt
                     sp_next = sampling_params_list[next_stage_id].clone()

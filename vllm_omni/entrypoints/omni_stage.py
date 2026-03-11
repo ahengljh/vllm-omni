@@ -280,7 +280,6 @@ class OmniStage:
             and self.stage_id is not None
         ):
             stage_config.engine_args.stage_id = self.stage_id
-        # PD disaggregation flags
         self.is_prefill_only: bool = getattr(stage_config, "is_prefill_only", False)
         self.is_decode_only: bool = getattr(stage_config, "is_decode_only", False)
         if hasattr(stage_config, "custom_process_input_func"):
@@ -690,12 +689,7 @@ class OmniStage:
             else:
                 _inject_global_id(ein)
 
-        # PD safeguard: store kv_transfer_params as a plain-dict backup in the
-        # payload so it definitely survives pickle even if the msgspec.Struct
-        # extra_args field is silently dropped (observed with omit_defaults=True
-        # in SamplingParams).  The backup fires only when _kv_transfer_params
-        # is not already in the payload, so overhead is minimal.
-        # TODO: open vLLM issue if confirmed reproducible
+        # Backup kv_transfer_params in case msgspec.Struct drops extra_args
         if "_kv_transfer_params" not in payload:
             sp = payload.get("sampling_params")
             if sp is not None and hasattr(sp, "extra_args") and sp.extra_args:
@@ -814,7 +808,6 @@ def _stage_worker(
 
     load_omni_general_plugins()
 
-    # -- PD disaggregation: monkey-patch MooncakeConnector before engine init --
     _is_prefill_only = stage_payload.get("is_prefill_only", False)
     _is_decode_only = stage_payload.get("is_decode_only", False)
     if _is_prefill_only or _is_decode_only:
@@ -822,9 +815,7 @@ def _stage_worker(
 
         apply_mooncake_connector_patch()
 
-    # IMPORTANT: Ensure vLLM's internal multiprocessing workers (e.g., GPUARWorker /
-    # GPUARModelRunner) are spawned with a fork-safe method.
-    # Mooncake / gRPC / RDMA and CUDA/NCCL can deadlock under fork-with-threads.
+    # Ensure spawn method for fork-safety with Mooncake/gRPC/RDMA/CUDA
     if _os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") != "spawn":
         _os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
         logger.info("[Stage] Set VLLM_WORKER_MULTIPROC_METHOD=spawn")
@@ -1073,10 +1064,7 @@ def _stage_worker(
         # Ensure that the popped tasks are with identical sampling params. Take one of them.
         batch_engine_sampling_params: OmniSamplingParams = batch_tasks[0]["sampling_params"]
 
-        # PD safeguard: if the task carries _kv_transfer_params (backup key
-        # stored by the orchestrator), ensure it's present in the SP's
-        # extra_args.  msgspec.Struct pickle with omit_defaults=True may
-        # silently drop the extra_args dict in some environments.
+        # Restore kv_transfer_params backup if extra_args was dropped by pickle
         _kv_backup = batch_tasks[0].get("_kv_transfer_params")
         if _kv_backup is not None:
             sp = batch_engine_sampling_params
@@ -1171,8 +1159,6 @@ def _stage_worker(
             _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
             logger.debug(f"Generate done: batch={len(batch_tasks)}, req_ids={batch_request_ids}, gen_ms={_gen_ms:.1f}")
 
-            # PD check: MooncakeConnector only sends KV when
-            # finish_reason is 'length' (FINISHED_LENGTH_CAPPED).
             if _kv_backup is not None:
                 for ro in gen_outputs:
                     _ro_fr = (
@@ -1300,7 +1286,6 @@ async def _stage_worker_async(
 
     load_omni_general_plugins()
 
-    # -- PD disaggregation: monkey-patch MooncakeConnector before engine init --
     _is_prefill_only = stage_payload.get("is_prefill_only", False)
     _is_decode_only = stage_payload.get("is_decode_only", False)
     if _is_prefill_only or _is_decode_only:
