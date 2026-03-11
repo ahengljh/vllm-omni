@@ -820,16 +820,14 @@ class Qwen3OmniMoeForConditionalGeneration(
         target_len = thinker_result_ids.shape[-1]
         if thinker_embed.shape[0] < target_len:
             pad_len = target_len - thinker_embed.shape[0]
-            thinker_embed = torch.cat(
-                (thinker_embed, torch.zeros(pad_len, thinker_embed.shape[1], device=thinker_embed.device, dtype=thinker_embed.dtype)),
-                dim=0,
-            )
+            pad = torch.zeros(pad_len, thinker_embed.shape[1],
+                              device=thinker_embed.device, dtype=thinker_embed.dtype)
+            thinker_embed = torch.cat((thinker_embed, pad), dim=0)
         if thinker_hidden.shape[0] < target_len:
             pad_len = target_len - thinker_hidden.shape[0]
-            thinker_hidden = torch.cat(
-                (thinker_hidden, torch.zeros(pad_len, thinker_hidden.shape[1], device=thinker_hidden.device, dtype=thinker_hidden.dtype)),
-                dim=0,
-            )
+            pad = torch.zeros(pad_len, thinker_hidden.shape[1],
+                              device=thinker_hidden.device, dtype=thinker_hidden.dtype)
+            thinker_hidden = torch.cat((thinker_hidden, pad), dim=0)
         im_start_indexes = torch.cat(
             (
                 torch.nonzero(input_ids[0] == self.config.im_start_token_id).squeeze(),
