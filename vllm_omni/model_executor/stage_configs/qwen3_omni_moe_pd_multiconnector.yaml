@@ -23,12 +23,6 @@
 # If the thinker model requires TP=2, set both stages to TP=2 and
 # allocate 2 GPUs for each (e.g. devices "0,1" and "2,3", 5 GPUs total).
 #
-# Example layout on 4x H100-80G GPUs (TP=1 for both):
-#   GPU 0: Reserved (e.g., API server)
-#   GPU 1: Thinker Prefill
-#   GPU 2: Thinker Decode
-#   GPU 3: Talker + Code2Wav
-#
 # Inter-stage data transfer uses MooncakeStoreConnector (TCP-based),
 # while KV cache transfer between prefill and decode uses MooncakeConnector (RDMA).
 
