@@ -23,8 +23,10 @@
 # If the thinker model requires TP=2, set both stages to TP=2 and
 # allocate 2 GPUs for each (e.g. devices "0,1" and "2,3", 5 GPUs total).
 #
-# Inter-stage data transfer uses MooncakeStoreConnector (TCP-based),
-# while KV cache transfer between prefill and decode uses MooncakeConnector (RDMA).
+# Example layout on 3x H100-80G GPUs (TP=1 for both):
+#   GPU 0: Thinker Prefill
+#   GPU 1: Thinker Decode
+#   GPU 2: Talker + Code2Wav
 
 async_chunk: false
 stage_args:
@@ -32,7 +34,7 @@ stage_args:
     stage_type: llm
     is_prefill_only: true
     runtime:
-      devices: "1"
+      devices: "0"
       max_batch_size: 16
     engine_args:
       model_stage: thinker
@@ -57,8 +59,6 @@ stage_args:
           mooncake_bootstrap_port: 25201
     final_output: false
     is_comprehension: true
-    output_connectors:
-      to_stage_1: connector_of_mooncake
     default_sampling_params:
       temperature: 0.4
       top_p: 0.9
@@ -72,7 +72,7 @@ stage_args:
     stage_type: llm
     is_decode_only: true
     runtime:
-      devices: "2"
+      devices: "1"
       max_batch_size: 64
     engine_args:
       model_stage: thinker
@@ -96,10 +96,6 @@ stage_args:
         kv_connector_extra_config:
           mooncake_bootstrap_port: 25202
     engine_input_source: [0]
-    input_connectors:
-      from_stage_0: connector_of_mooncake
-    output_connectors:
-      to_stage_2: connector_of_mooncake
     final_output: true
     final_output_type: text
     is_comprehension: true
@@ -115,7 +111,7 @@ stage_args:
   - stage_id: 2
     stage_type: llm
     runtime:
-      devices: "3"
+      devices: "2"
       max_batch_size: 64
     engine_args:
       model_stage: talker
@@ -131,10 +127,6 @@ stage_args:
       distributed_executor_backend: "mp"
       hf_config_name: talker_config
     engine_input_source: [1]
-    input_connectors:
-      from_stage_1: connector_of_mooncake
-    output_connectors:
-      to_stage_3: connector_of_mooncake
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker
     default_sampling_params:
       temperature: 0.9
@@ -148,7 +140,7 @@ stage_args:
   - stage_id: 3
     stage_type: llm
     runtime:
-      devices: "3"
+      devices: "2"
       max_batch_size: 1
     engine_args:
       model_stage: code2wav
@@ -165,8 +157,6 @@ stage_args:
       max_num_batched_tokens: 1000000
       hf_config_name: thinker_config
     engine_input_source: [2]
-    input_connectors:
-      from_stage_2: connector_of_mooncake
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav
     final_output: true
     final_output_type: audio
@@ -187,15 +177,10 @@ runtime:
     max_inflight: 1
 
   connectors:
-    connector_of_mooncake:
-      name: MooncakeStoreConnector
+    shared_memory_connector:
+      name: SharedMemoryConnector
       extra:
-        host: "127.0.0.1"
-        metadata_server: "http://127.0.0.1:8181/metadata"
-        master: "127.0.0.1:50051"
-        segment: 512000000
-        localbuf: 64000000
-        proto: "tcp"
+        shm_threshold_bytes: 65536
 
   edges:
     - from: 0
