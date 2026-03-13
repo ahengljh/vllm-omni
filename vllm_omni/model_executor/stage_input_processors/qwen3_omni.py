@@ -262,6 +262,10 @@ def thinker2talker(
 # Talker -> Code2Wav
 # =========================
 
+# Default max prompt length for code2wav (matches model default max_model_len).
+# Flattened codec codes (seq_len * num_quantizers) must not exceed this.
+_CODE2WAV_MAX_PROMPT_LEN = 65536
+
 
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
@@ -340,9 +344,23 @@ def talker2code2wav(
     for talker_output in talker_outputs:
         output = talker_output.outputs[0]
         seq_len = len(output.token_ids) - 1
+        codes_tensor = output.multimodal_output["code_predictor_codes"]
+        num_quantizers = codes_tensor.shape[0]
+
+        # Truncate if flattened codec codes would exceed code2wav max_model_len
+        max_seq_len = _CODE2WAV_MAX_PROMPT_LEN // num_quantizers
+        if seq_len > max_seq_len:
+            logger.warning(
+                "Truncating talker codec from %d to %d frames "
+                "(%d > %d flattened tokens) for code2wav",
+                seq_len, max_seq_len,
+                seq_len * num_quantizers, _CODE2WAV_MAX_PROMPT_LEN,
+            )
+            seq_len = max_seq_len
+
         # [num_quantizers, seq_len] -> [seq_len, num_quantizers] -> flat
         codec_codes = (
-            output.multimodal_output["code_predictor_codes"][:, -seq_len:]
+            codes_tensor[:, -seq_len:]
             .to(torch.long)
             .transpose(0, 1)
             .cpu()
