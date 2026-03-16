@@ -72,6 +72,7 @@ class OmniLLM(LLM):
         shm_threshold_bytes: int = 65536,
         batch_timeout: int = 10,
         init_timeout: int = 300,
+        skip_connector_init: bool = False,
         **kwargs: Any,
     ):
         """LLM constructor with omni-specific configuration loading."""
@@ -84,10 +85,13 @@ class OmniLLM(LLM):
         # Resolve model config path for connectors
         self.config_path = resolve_model_config_path(model)
 
-        # Initialize connectors
-        self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
-            self.config_path, worker_backend=self.worker_backend, shm_threshold_bytes=shm_threshold_bytes
-        )
+        if skip_connector_init:
+            self.omni_transfer_config = None
+            self.connectors = {}
+        else:
+            self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
+                self.config_path, worker_backend=self.worker_backend, shm_threshold_bytes=shm_threshold_bytes
+            )
 
         # Initialize LLM engine
         if "disable_log_stats" not in kwargs:

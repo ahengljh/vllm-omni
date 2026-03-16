@@ -136,6 +136,7 @@ class AsyncOmniDiffusion:
         sampling_params: OmniDiffusionSamplingParams,
         request_id: str | None = None,
         lora_request: LoRARequest | None = None,
+        kv_sender_info: dict | None = None,
     ) -> OmniRequestOutput:
         """Generate images asynchronously from a text prompt.
 
@@ -163,6 +164,7 @@ class AsyncOmniDiffusion:
             prompts=[prompt],
             sampling_params=sampling_params,
             request_ids=[request_id],
+            kv_sender_info=kv_sender_info,
         )
 
         logger.debug("Starting generation for request %s", request_id)

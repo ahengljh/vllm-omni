@@ -244,6 +244,24 @@ def _build_od_config(engine_args: dict[str, Any], model: str) -> dict[str, Any]:
     return od_config
 
 
+def _detect_node_ip() -> str | None:
+    """Best-effort local IP detection for cross-node RDMA bootstrap."""
+    import socket
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+        finally:
+            sock.close()
+    except Exception:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return None
+
+
 class OmniStage:
     """Stage manager for orchestrating a single stage in the omni pipeline.
 
@@ -265,6 +283,7 @@ class OmniStage:
         self.tokenizer = None
         self.input_preprocessor = None
         self.is_tracing_enabled = False
+        self.node_ip = None
         self.stage_id = stage_config.stage_id
         self.engine_args = stage_config.engine_args
         self.model_stage = stage_config.engine_args.model_stage
@@ -367,6 +386,10 @@ class OmniStage:
             is_tracing_enabled: Boolean indicating if tracing is enabled
         """
         self.is_tracing_enabled = is_tracing_enabled
+
+    def set_node_ip(self, node_ip: str) -> None:
+        """Set the stage node IP used to bootstrap cross-node RDMA."""
+        self.node_ip = node_ip
 
     def set_engine_outputs(self, engine_outputs: EngineCoreOutput) -> None:
         """Set the engine outputs for this stage.
@@ -897,7 +920,7 @@ def _stage_worker(
             engine_args = filter_dataclass_kwargs(OmniEngineArgs, engine_args)
             engine_args.pop("model", None)
             # Default to LLM engine
-            stage_engine = OmniLLM(model=model, **engine_args)
+            stage_engine = OmniLLM(model=model, skip_connector_init=True, **engine_args)
 
     logger.debug("Engine initialized")
     # Initialize OmniConnectors if configured
@@ -912,7 +935,10 @@ def _stage_worker(
 
     # Signal readiness to orchestrator
     try:
-        out_q.put({"type": "stage_ready", "stage_id": stage_id})
+        stage_ready_payload = {"type": "stage_ready", "stage_id": stage_id}
+        if node_ip := _detect_node_ip():
+            stage_ready_payload["node_ip"] = node_ip
+        out_q.put(stage_ready_payload)
     except Exception:
         pass
 
@@ -1118,9 +1144,13 @@ def _stage_worker(
             if stage_type == "diffusion":
                 stage_engine = cast(OmniDiffusion, stage_engine)
                 batch_engine_sampling_params = cast(OmniDiffusionSamplingParams, batch_engine_sampling_params)
+                kv_sender_info = batch_tasks[0].get("kv_sender_info") if batch_tasks else None
                 # Diffusion generate returns results directly, not an iterator
                 diffusion_results = stage_engine.generate(
-                    batch_engine_inputs, batch_engine_sampling_params, batch_request_ids
+                    batch_engine_inputs,
+                    batch_engine_sampling_params,
+                    batch_request_ids,
+                    kv_sender_info=kv_sender_info,
                 )
                 gen_outputs.extend(diffusion_results)
                 # Assign request_ids if not present
@@ -1449,6 +1479,8 @@ async def _stage_worker_async(
         # Only add is_tracing_enabled for LLM engines
         if stage_type != "diffusion":
             stage_ready_payload["is_tracing_enabled"] = await stage_engine.is_tracing_enabled()
+        if node_ip := _detect_node_ip():
+            stage_ready_payload["node_ip"] = node_ip
         out_q.put(stage_ready_payload)
     except Exception as e:
         logger.warning("Failed to send stage ready signal: %s", e)
@@ -1495,8 +1527,14 @@ async def _stage_worker_async(
 
             if stage_type == "diffusion":
                 diffusion_sampling_params = cast(OmniDiffusionSamplingParams, task["sampling_params"])
+                kv_sender_info = task.get("kv_sender_info")
                 # AsyncOmniDiffusion.generate returns a single result, not an async generator
-                gen_output = await cast(AsyncOmniDiffusion, stage_engine).generate(ein, diffusion_sampling_params, rid)
+                gen_output = await cast(AsyncOmniDiffusion, stage_engine).generate(
+                    ein,
+                    diffusion_sampling_params,
+                    rid,
+                    kv_sender_info=kv_sender_info,
+                )
                 _gen_t1 = _time.time()
                 _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
                 await generation_out_q.put((rid, gen_output, _gen_ms))

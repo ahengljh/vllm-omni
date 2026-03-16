@@ -116,6 +116,7 @@ class OmniDiffusion:
         prompts: OmniPromptType | Sequence[OmniPromptType],
         sampling_params: OmniDiffusionSamplingParams,
         request_ids: list[str] = [],
+        kv_sender_info: dict | None = None,
     ) -> list[OmniRequestOutput]:
         _t0 = time.perf_counter()
         if isinstance(prompts, (str, dict)):
@@ -127,7 +128,12 @@ class OmniDiffusion:
         if len(request_ids) < len(prompts):
             request_ids.extend(f"{i + len(request_ids)}_{uuid.uuid4()}" for i in range(len(prompts) - len(request_ids)))
 
-        request = OmniDiffusionRequest(prompts, sampling_params, request_ids)
+        request = OmniDiffusionRequest(
+            prompts,
+            sampling_params,
+            request_ids,
+            kv_sender_info=kv_sender_info,
+        )
         result = self._run_engine(request)
         _t_ms = (time.perf_counter() - _t0) * 1000
         logger.info("OmniDiffusion.generate total: %.2f ms", _t_ms)

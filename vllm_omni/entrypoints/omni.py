@@ -225,6 +225,30 @@ class OmniBase:
             cache_config = self._get_default_cache_config(cache_backend)
         return cache_config
 
+    def _build_kv_sender_info(self, sender_stage_id: int = 0) -> dict[int, dict[str, Any]] | None:
+        """Build deterministic sender info for KV transfer RDMA receivers."""
+        if sender_stage_id >= len(self.stage_list):
+            return None
+
+        sender_stage = self.stage_list[sender_stage_id]
+        sender_node_ip = getattr(sender_stage, "node_ip", None)
+        if not sender_node_ip:
+            logger.warning("[%s] Sender stage %s has no node_ip", self._name, sender_stage_id)
+            return None
+
+        base_port = 50051
+        kv_transfer_port_offset = 100
+        zmq_port = base_port + kv_transfer_port_offset + int(sender_stage_id)
+
+        kv_sender_info = {
+            0: {
+                "host": sender_node_ip,
+                "zmq_port": zmq_port,
+            }
+        }
+        logger.info("[%s] Built kv_sender_info: %s", self._name, kv_sender_info)
+        return kv_sender_info
+
     def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> list[dict[str, Any]]:
         """Create default diffusion stage configuration.
 
@@ -525,6 +549,9 @@ class OmniBase:
             logger.debug(f"[{self._name}] Stage-{stage_id} process started")
 
     def _process_stage_ready(self, stage: OmniStage, stage_id: int, result: dict[str, Any]) -> None:
+        node_ip = result.get("node_ip")
+        if node_ip is not None:
+            stage.set_node_ip(node_ip)
         self._stages_ready.add(stage_id)
         logger.info(f"[{self._name}] Stage-{stage_id} reported ready")
 
@@ -1248,6 +1275,7 @@ class Omni(OmniBase):
                             final_stage_id_to_prompt,
                             metrics,
                             remaining_by_stage,
+                            kv_sender_info=self._build_kv_sender_info(sender_stage_id=0),
                         )
                         if not success:
                             cfg.consume_parent_failure(ready_parent)
@@ -1369,6 +1397,7 @@ class Omni(OmniBase):
                                 final_stage_id_to_prompt,
                                 metrics,
                                 remaining_by_stage,
+                                kv_sender_info=self._build_kv_sender_info(sender_stage_id=0),
                             )
                             if not success:
                                 cfg.consume_parent_failure(req_id)
@@ -1402,6 +1431,7 @@ class Omni(OmniBase):
                     connector = self.connectors.get(connector_key)
                     sent_via_connector = False
                     if connector:
+                        kv_sender_info = self._build_kv_sender_info(sender_stage_id=0)
                         sent_via_connector = try_send_via_connector(
                             connector=connector,
                             stage_id=stage_id,
@@ -1412,6 +1442,7 @@ class Omni(OmniBase):
                             original_prompt=request_id_to_prompt[req_id],
                             next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
                             metrics=metrics,
+                            kv_sender_info=kv_sender_info,
                         )
 
                     if not sent_via_connector:

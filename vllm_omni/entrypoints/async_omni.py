@@ -696,6 +696,7 @@ class AsyncOmni(OmniBase):
 
                 sent_via_connector = False
                 if connector:
+                    kv_sender_info = self._build_kv_sender_info(sender_stage_id=0)
                     sent_via_connector = try_send_via_connector(
                         connector=connector,
                         stage_id=stage_id,
@@ -706,6 +707,7 @@ class AsyncOmni(OmniBase):
                         original_prompt=prompt,
                         next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
                         metrics=metrics,
+                        kv_sender_info=kv_sender_info,
                     )
 
                 if not sent_via_connector:
