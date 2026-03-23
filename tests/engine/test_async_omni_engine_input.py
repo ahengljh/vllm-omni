@@ -61,3 +61,29 @@ def test_build_add_request_message_preserves_additional_information():
     assert request.additional_information.entries["text"].list_data == ["hello world"]
     assert request.additional_information.entries["speaker"].list_data == ["vivian"]
     output_processor.add_request.assert_called_once()
+
+
+def test_build_cfg_companion_stage0_params_shortens_decode():
+    params = SamplingParams(max_tokens=2048)
+    params.min_tokens = 7
+    params.stop = ["</s>"]
+    params.stop_token_ids = [42]
+    params.include_stop_str_in_output = True
+    params.extra_args = {"negative_prompt": ""}
+
+    companion = AsyncOmniEngine._build_cfg_companion_stage0_params(params)
+
+    assert companion is not params
+    assert companion.max_tokens == 1
+    assert companion.min_tokens == 1
+    assert companion.stop == []
+    assert companion.stop_token_ids == []
+    assert companion.include_stop_str_in_output is False
+    assert companion.extra_args == {"negative_prompt": "", "cfg_companion": True}
+
+    assert params.max_tokens == 2048
+    assert params.min_tokens == 7
+    assert params.stop == ["</s>"]
+    assert params.stop_token_ids == [42]
+    assert params.include_stop_str_in_output is True
+    assert params.extra_args == {"negative_prompt": ""}

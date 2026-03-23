@@ -275,6 +275,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             output_modalities if output_modalities is not None else self.engine_client.output_modalities
         )
 
+        num_inference_steps = None
         # Omni multistage image generation: Stage-0 (AR) should receive a clean
         # text prompt (and optional conditioning image/size) so the model's own
         # processor can construct the correct inputs.
@@ -308,6 +309,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     extra_body = request.model_extra or {}
                 height = extra_body.get("height")
                 width = extra_body.get("width")
+                num_inference_steps = extra_body.get("num_inference_steps")
+                if num_inference_steps is not None:
+                    try:
+                        num_inference_steps = int(num_inference_steps)
+                    except Exception:
+                        num_inference_steps = None
                 if "size" in extra_body:
                     try:
                         size_str = extra_body["size"]
@@ -325,7 +332,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     try:
                         img_bytes = base64.b64decode(reference_images[0])
                         img = Image.open(BytesIO(img_bytes))
-                        engine_prompt_image = {"img2img": img}
+                        engine_prompt_image = {"image": img, "img2img": img}
                         is_img2img = True
                     except Exception:
                         engine_prompt_image = None
@@ -333,7 +340,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # Override the prompts produced by chat-template preprocessing.
                 tprompt: OmniTextPrompt = {"prompt": extracted_prompt}
                 if is_img2img:
-                    tprompt["modalities"] = ["img2img"]
+                    if tprompt["prompt"] and "<|image_pad|>" not in tprompt["prompt"]:
+                        tprompt["prompt"] = f"<|image_pad|>{tprompt['prompt']}"
+                    tprompt["modalities"] = ["image", "img2img"]
                 else:
                     tprompt["modalities"] = ["image"]
                 if negative_prompt is not None:
@@ -371,14 +380,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     # Use standard OpenAI API parameters for comprehension stage
                     sampling_params_list = self._build_sampling_params_list_from_request(request)
 
-                # Apply user-specified height/width to diffusion stage(s) for image generation
-                if _image_gen_height is not None or _image_gen_width is not None:
+                # Apply user-specified image generation overrides to diffusion stage(s)
+                if _image_gen_height is not None or _image_gen_width is not None or num_inference_steps is not None:
                     for idx, sp in enumerate(sampling_params_list):
-                        # Diffusion stages typically have height/width attributes
+                        # Diffusion stages typically have height/width and diffusion-step attributes
                         if hasattr(sp, "height") and _image_gen_height is not None:
                             sp.height = _image_gen_height
                         if hasattr(sp, "width") and _image_gen_width is not None:
                             sp.width = _image_gen_width
+                        if hasattr(sp, "num_inference_steps") and num_inference_steps is not None:
+                            sp.num_inference_steps = num_inference_steps
 
                 self._log_inputs(
                     request_id,

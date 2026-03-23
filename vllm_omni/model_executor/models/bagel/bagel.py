@@ -85,7 +85,9 @@ class OmniBagelProcessor(BagelProcessor):
 
 class OmniBagelProcessingInfo(BaseProcessingInfo):
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        return {"image": 1, "img2img": 1}
+        # Split stage-0 img2img can materialize one logical image as two
+        # adjacent multimodal items: VAE block then ViT block.
+        return {"image": 1, "img2img": 2}
 
     def get_hf_processor(self, **kwargs: object):
         return self.ctx.get_hf_processor(OmniBagelProcessor, **kwargs)
@@ -231,37 +233,46 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
         if has_img2img and self.IMG2IMG_PLACEHOLDER not in prompt:
             prompt = f"{self.IMG2IMG_PLACEHOLDER}{prompt}"
 
+        dual_img2img_dummy_prompt = prompt.strip() == "<|image_pad|><|fim_middle|>"
+
+        if has_image and has_img2img and dual_img2img_dummy_prompt:
+            # vLLM startup probes build one synthetic dual-modality sample to
+            # size the multimodal encoder budget. Keep both fields in that path
+            # so _get_mm_fields_config() validation still sees one image item
+            # and one img2img item.
+            image_outputs = super()._call_hf_processor(
+                prompt,
+                {"images": mm_data["images"]},
+                mm_kwargs,
+                tok_kwargs,
+            )
+            img2img_kwargs = dict(mm_kwargs)
+            img2img_kwargs["is_img2img"] = True
+            img2img_outputs = super()._call_hf_processor(
+                prompt,
+                {"images": mm_data["pixel_values_img2img"]},
+                img2img_kwargs,
+                tok_kwargs,
+            )
+            outputs = dict(img2img_outputs)
+            if "pixel_values" in outputs:
+                outputs["pixel_values_img2img"] = outputs.pop("pixel_values")
+            if "pixel_values" in image_outputs:
+                outputs["pixel_values"] = image_outputs["pixel_values"]
+            return BatchFeature(outputs)
+
         if has_image and has_img2img:
-            outputs = BatchFeature()
+            # Formal /v1/images/edits duplicates the reference image into both
+            # image and img2img slots so one-stage can still read the generic
+            # image payload. The split AR stage should only materialize the
+            # img2img path; encoding both duplicates visual conditioning and
+            # diverges from the one-stage i2i semantics.
+            prompt = prompt.replace("<|image_pad|>", "")
+            mm_data = dict(mm_data)
+            del mm_data["images"]
+            has_image = False
 
-            img_data = dict(mm_data)
-            if "pixel_values_img2img" in img_data:
-                del img_data["pixel_values_img2img"]
-            kwargs_img = dict(mm_kwargs)
-            kwargs_img["is_img2img"] = False
-            out_img = super()._call_hf_processor(prompt, img_data, kwargs_img, tok_kwargs)
-            if "pixel_values" in out_img:
-                outputs["pixel_values"] = out_img["pixel_values"]
-            for k, v in out_img.items():
-                if k != "pixel_values":
-                    outputs[k] = v
-
-            img2img_data = dict(mm_data)
-            if "images" in img2img_data:
-                del img2img_data["images"]
-            img2img_data["images"] = img2img_data.pop("pixel_values_img2img")
-            kwargs_img2img = dict(mm_kwargs)
-            kwargs_img2img["is_img2img"] = True
-            out_img2img = super()._call_hf_processor(prompt, img2img_data, kwargs_img2img, tok_kwargs)
-            if "pixel_values" in out_img2img:
-                outputs["pixel_values_img2img"] = out_img2img["pixel_values"]
-            for k, v in out_img2img.items():
-                if k not in outputs:
-                    outputs[k] = v
-
-            return outputs
-
-        elif has_img2img:
+        if has_img2img:
             mm_data = dict(mm_data)
             mm_data["images"] = mm_data.pop("pixel_values_img2img")
             mm_kwargs = dict(mm_kwargs)
@@ -309,6 +320,8 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
             )
 
         img2img_token_id = tokenizer.get_vocab().get("<|fim_middle|>")
+        vision_start_token_id = tokenizer.get_vocab().get("<|vision_start|>")
+        vision_end_token_id = tokenizer.get_vocab().get("<|vision_end|>")
         if img2img_token_id is not None:
             vit_config = hf_config.vit_config
             image_size = vit_config.image_size
@@ -338,15 +351,25 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
                 new_w = min(new_w, max_img_size)
 
                 num_vae_patches = (new_h // latent_downsample) * (new_w // latent_downsample)
-                num_vae_total = num_vae_patches + 2
-                num_vit_total = num_vit_patches + 2
-                # +1 separator between VAE and ViT blocks so that
-                # extract_embeds_range() produces two distinct mm_prefix_range
-                # entries, preventing VAE tokens from attending to ViT.
-                total = num_vae_total + 1 + num_vit_total
-                tokens = [img2img_token_id] * total
+                pair_role = item_idx % 2
+                num_block_patches = num_vae_patches if pair_role == 0 else num_vit_patches
 
-                embed_mask = [True] * num_vae_total + [False] + [True] * num_vit_total
+                if vision_start_token_id is not None and vision_end_token_id is not None:
+                    # Split stage-0 now exposes the img2img prefix as two
+                    # adjacent multimodal items per logical image:
+                    #   item 0 -> [vision_start][vae patches][vision_end]
+                    #   item 1 -> [vision_start][vit patches][vision_end]
+                    # This lets vLLM emit two independent mm_prefix_range spans
+                    # without inserting a real separator token into the KV cache.
+                    tokens = [vision_start_token_id]
+                    tokens.extend([img2img_token_id] * num_block_patches)
+                    tokens.append(vision_end_token_id)
+                    embed_mask = [True] * len(tokens)
+                else:
+                    total = num_block_patches + 2
+                    tokens = [img2img_token_id] * total
+                    embed_mask = [True] * total
+
                 return PromptUpdateDetails(
                     full=tokens,
                     is_embed=lambda _tok, _seq, _m=embed_mask: torch.tensor(_m, dtype=torch.bool),
@@ -593,7 +616,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             mode="bicubic",
             align_corners=False,
         )
-
         vit_embeddings_tuple = self._process_image_input({"pixel_values": vit_pixel_values})
 
         marker_ids = torch.tensor(
@@ -607,8 +629,15 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
 
         results = []
 
-        for i in range(num_images):
-            single_pv = pixel_values[i : i + 1]
+        if num_images % 2 != 0:
+            pair_starts = range(num_images)
+            pair_size = 1
+        else:
+            pair_starts = range(0, num_images, 2)
+            pair_size = 2
+
+        for pair_start in pair_starts:
+            single_pv = pixel_values[pair_start : pair_start + 1]
             single_pv = self._resize_to_stride(single_pv)
             H, W = single_pv.shape[2:]
 
@@ -632,15 +661,22 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                 timestep_embeds = self.time_embedder(packed_timesteps.to(padded_latent))
             vae_embeds = self.vae2llm(latent) + timestep_embeds + pos_embed
 
-            vit_emb = vit_embeddings_tuple[i] if i < len(vit_embeddings_tuple) else vit_embeddings_tuple[0]
+            vit_emb = (
+                vit_embeddings_tuple[pair_start] if pair_start < len(vit_embeddings_tuple) else vit_embeddings_tuple[0]
+            )
 
             se = start_embed.to(vae_embeds.dtype)
             ee = end_embed.to(vae_embeds.dtype)
-            combined = torch.cat([se, vae_embeds, ee, se, vit_emb, ee], dim=0)
-            results.append(combined)
+            vae_block = torch.cat([se, vae_embeds, ee], dim=0)
+            vit_block = torch.cat([se, vit_emb, ee], dim=0)
 
-            num_vae = h * w + 2  # +2 for start/end markers
-            num_vit = vit_emb.shape[0] + 2
+            if pair_size == 1:
+                results.append(torch.cat([vae_block, vit_block], dim=0))
+            else:
+                results.extend([vae_block, vit_block])
+
+            num_vae = h * w
+            num_vit = vit_emb.shape[0]
             info = (num_vae, num_vit, int(H), int(W))
             self._pending_img2img_info.append(info)
             self._cfg_companion_queue.append((info, 2))  # cfg_text + cfg_img
@@ -666,7 +702,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             cached, remaining = self._cfg_companion_queue[0]
             remaining -= 1
             num_vae, num_vit, img_H, img_W = cached
-            num_img2img = num_vae + 1 + num_vit  # +1 separator
+            num_img2img = num_vae + num_vit + 4
             seq_len = inputs_embeds.shape[0] if inputs_embeds is not None else positions.shape[0]
 
             if inputs_embeds is not None and seq_len >= num_img2img:
@@ -688,8 +724,9 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
 
     def _adjust_positions_for_img2img(self, positions: torch.Tensor) -> torch.Tensor:
         """Rewrite position IDs to match the single-stage DiT scheme:
-        VAE tokens -> position 0, separator -> position 0,
-        ViT tokens -> position 1, text -> 2, 3, ...
+        [vision_start][vae patches][vision_end] -> position 0,
+        [vision_start][vit patches][vision_end] -> position 1,
+        text -> 2, 3, ...
 
         Also computes ``self._vae_token_mask`` (bool tensor, True for actual
         VAE latent patches that should use gen-mode weights) and pushes
@@ -721,13 +758,14 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
 
             if img2img_idx < len(info_list):
                 num_vae, num_vit, img_H, img_W = info_list[img2img_idx]
-                num_img2img = num_vae + 1 + num_vit  # +1 separator
+                first_block_len = num_vae + 2
+                second_block_len = num_vit + 2
+                num_img2img = first_block_len + second_block_len
 
                 if req_len >= num_img2img:
-                    new_positions[start : start + num_vae] = 0
-                    new_positions[start + num_vae] = 0  # separator
-                    vit_start = start + num_vae + 1
-                    new_positions[vit_start : vit_start + num_vit] = 1
+                    new_positions[start : start + first_block_len] = 0
+                    vit_start = start + first_block_len
+                    new_positions[vit_start : vit_start + second_block_len] = 1
                     num_text = req_len - num_img2img
                     if num_text > 0:
                         text_start = start + num_img2img
@@ -736,8 +774,8 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                         )
 
                     # VAE gen-mode mask: only actual VAE patches (not markers)
-                    vae_patches_start = start + 1  # skip start_marker
-                    vae_patches_end = start + num_vae - 1  # before end_marker
+                    vae_patches_start = start + 1
+                    vae_patches_end = vae_patches_start + num_vae
                     if vae_patches_end > vae_patches_start:
                         vae_mask[vae_patches_start:vae_patches_end] = True
 

@@ -61,19 +61,6 @@ def expand_cfg_prompts(
 
     neg_prompt = _get_negative_prompt(prompt, sampling_params)
 
-    if "image" in modalities:
-        neg_prompt_dict = {
-            "prompt": neg_prompt,
-            "modalities": prompt.get("modalities", []),
-        }
-        return [
-            ExpandedPrompt(
-                prompt=neg_prompt_dict,
-                role="cfg_text",
-                request_id_suffix=CFG_TEXT_SUFFIX,
-            ),
-        ]
-
     if "img2img" in modalities:
         IMG2IMG_PLACEHOLDER = "<|fim_middle|>"
 
@@ -82,14 +69,15 @@ def expand_cfg_prompts(
             "modalities": ["img2img"],
         }
         mm_data = prompt.get("multi_modal_data")
-        if mm_data:
-            cfg_text_dict["multi_modal_data"] = mm_data
+        if mm_data and "img2img" in mm_data:
+            cfg_text_dict["multi_modal_data"] = {"img2img": mm_data["img2img"]}
 
         original_text = prompt.get("prompt", "")
-        cfg_img_text = original_text.replace(IMG2IMG_PLACEHOLDER, "")
+        cfg_img_text = original_text.replace(IMG2IMG_PLACEHOLDER, "").replace("<|image_pad|>", "")
+        # Mirror one-stage Bagel i2i semantics: cfg_img is the positive-text
+        # branch without image conditioning, so keep it as plain text only.
         cfg_img_dict: dict[str, Any] = {
             "prompt": cfg_img_text,
-            "modalities": ["img2img"],
         }
 
         return [
@@ -102,6 +90,22 @@ def expand_cfg_prompts(
                 prompt=cfg_img_dict,
                 role="cfg_img",
                 request_id_suffix=CFG_IMG_SUFFIX,
+            ),
+        ]
+
+    if "image" in modalities:
+        # vLLM encoder-decoder validation rejects an empty decoder prompt.
+        # Keep split t2i semantically close to one-stage's empty negative prompt
+        # while still producing at least one decoder token.
+        neg_prompt_dict = {
+            "prompt": neg_prompt if neg_prompt != "" else " ",
+            "modalities": prompt.get("modalities", []),
+        }
+        return [
+            ExpandedPrompt(
+                prompt=neg_prompt_dict,
+                role="cfg_text",
+                request_id_suffix=CFG_TEXT_SUFFIX,
             ),
         ]
 
@@ -171,9 +175,10 @@ def _get_negative_prompt(
 ) -> str:
     """Resolve the negative prompt for CFG from prompt or sampling params.
 
-    An empty string is treated the same as absent (falls through to
-    the Bagel default token pair), because an empty negative prompt is
-    not meaningful for CFG guidance.
+    Align the split AR-stage default with the one-stage Bagel pipeline:
+    if no negative prompt is supplied, use the empty string rather than
+    synthesizing a special-token placeholder. The earlier placeholder
+    default made split cfg_text semantics diverge from one-stage.
     """
     neg = prompt.get("negative_prompt")
     if neg:
@@ -184,4 +189,4 @@ def _get_negative_prompt(
         if neg:
             return neg
 
-    return "<|im_start|><|im_end|>"
+    return ""
