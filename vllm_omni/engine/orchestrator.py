@@ -103,7 +103,6 @@ class OrchestratorRequestState:
 
     # Metrics: timestamp when request was submitted to each stage
     stage_submit_ts: dict[int, float] = field(default_factory=dict)
-    trace_ts: dict[str, float] = field(default_factory=dict)
 
 
 class Orchestrator:
@@ -352,7 +351,6 @@ class Orchestrator:
         ):
             # If this parent has CFG companions, defer forwarding until all done.
             if req_id in self._companion_map and not self._all_companions_done(req_id):
-                req_state.trace_ts["parent_kv_ready"] = _time.time()
                 self._deferred_parents[req_id] = {
                     "stage_id": stage_id,
                     "output": output,
@@ -389,54 +387,18 @@ class Orchestrator:
         next_stage_id = stage_id + 1
         return next_stage_id in req_state.stage_submit_ts
 
-    def _log_cfg_timeline(self, parent_id: str, req_state: OrchestratorRequestState, reason: str) -> None:
-        base = req_state.trace_ts.get("stage0_submit")
-        if base is None:
-            return
-
-        def _delta_ms(key: str) -> str:
-            ts = req_state.trace_ts.get(key)
-            if ts is None:
-                return "n/a"
-            return f"{(ts - base) * 1000.0:.1f}"
-
-        logger.info(
-            "[Orchestrator][Profile] req=%s reason=%s stage0_submit=0.0ms "
-            "parent_kv_ready=%sms cfg_text_ready=%sms cfg_img_ready=%sms "
-            "attach=%sms stage1_submit=%sms",
-            parent_id,
-            reason,
-            _delta_ms("parent_kv_ready"),
-            _delta_ms("cfg_ready_cfg_text"),
-            _delta_ms("cfg_ready_cfg_img"),
-            _delta_ms("attach_cfg_ids"),
-            _delta_ms("stage1_submit"),
-        )
-
     async def _handle_cfg_companion_ready(self, req_id: str) -> None:
         parent_id = self._companion_to_parent.get(req_id)
         if parent_id is None:
             return
-        parent_state = self.request_states.get(parent_id)
-        if parent_state is not None:
-            role_map = self._companion_map.get(parent_id, {})
-            role = next((r for r, cid in role_map.items() if cid == req_id), None)
-            if role is not None:
-                parent_state.trace_ts[f"cfg_ready_{role}"] = _time.time()
         done_set = self._companion_done.setdefault(parent_id, set())
         if req_id in done_set:
             return
         done_set.add(req_id)
-        logger.info(
-            "[Orchestrator] CFG companion ready for forward: %s (parent=%s)",
-            req_id,
-            parent_id,
-        )
         if parent_id in self._deferred_parents and self._all_companions_done(parent_id):
             deferred = self._deferred_parents.pop(parent_id)
             parent_state = self.request_states.get(parent_id)
             if parent_state is not None and not self._next_stage_already_submitted(deferred["stage_id"], parent_state):
-                self._log_cfg_timeline(parent_id, parent_state, reason="all_cfg_ready_before_forward")
                 await self._forward_to_next_stage(
                     parent_id,
                     deferred["stage_id"],
@@ -464,23 +426,11 @@ class Orchestrator:
             if self._next_stage_already_submitted(stage_id, req_state):
                 continue
             if req_id in self._companion_map and not self._all_companions_done(req_id):
-                req_state.trace_ts["parent_kv_ready"] = _time.time()
                 self._deferred_parents[req_id] = {
                     "stage_id": stage_id,
                     "output": raw_output,
                 }
-                logger.info(
-                    "[Orchestrator] Parent %s KV ready; deferred until CFG companions are ready",
-                    req_id,
-                )
             else:
-                logger.info(
-                    "[Orchestrator] Parent %s KV ready; forwarding to stage-%s before decode completion",
-                    req_id,
-                    stage_id + 1,
-                )
-                req_state.trace_ts["parent_kv_ready"] = _time.time()
-                self._log_cfg_timeline(req_id, req_state, reason="parent_forward_without_wait")
                 await self._forward_to_next_stage(req_id, stage_id, raw_output, req_state)
 
     def _build_stage_metrics(
@@ -589,13 +539,11 @@ class Orchestrator:
                 if isinstance(params, OmniDiffusionSamplingParams):
                     params = copy.deepcopy(params)
                     params.cfg_kv_request_ids = cfg_ids
-                    req_state.trace_ts["attach_cfg_ids"] = _time.time()
                     logger.info(
                         "[Orchestrator] Attaching cfg_kv_request_ids=%s to req %s",
                         cfg_ids,
                         req_id,
                     )
-                    self._log_cfg_timeline(req_id, req_state, reason="attach_cfg_ids")
 
             kv_sender_info = self._build_kv_sender_info(sender_stage_id=stage_id)
             if isinstance(diffusion_prompt, list):
@@ -612,10 +560,7 @@ class Orchestrator:
                     params,
                     kv_sender_info=kv_sender_info,
                 )
-            submit_ts = _time.time()
-            req_state.stage_submit_ts[next_stage_id] = submit_ts
-            req_state.trace_ts["stage1_submit"] = submit_ts
-            self._log_cfg_timeline(req_id, req_state, reason="stage1_submitted")
+            req_state.stage_submit_ts[next_stage_id] = _time.time()
             return
 
         self.stage_clients[stage_id].set_engine_outputs([output])
@@ -725,7 +670,6 @@ class Orchestrator:
         )
         now = _time.time()
         req_state.stage_submit_ts[stage_id] = now
-        req_state.trace_ts["stage0_submit"] = now
         self.request_states[request_id] = req_state
 
         # Stage-0 prompt is already a fully-formed OmniEngineCoreRequest
@@ -845,7 +789,6 @@ class Orchestrator:
         )
         now = _time.time()
         companion_state.stage_submit_ts[0] = now
-        companion_state.trace_ts["stage0_submit"] = now
         self.request_states[companion_id] = companion_state
 
         request = companion_prompt  # Already a processed OmniEngineCoreRequest

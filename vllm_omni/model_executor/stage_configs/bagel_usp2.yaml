@@ -17,7 +17,7 @@ stage_args:
       trust_remote_code: true
       engine_output_type: text
       distributed_executor_backend: "mp"
-      enable_prefix_caching: true
+      enable_prefix_caching: false
       max_num_batched_tokens: 32768
       tensor_parallel_size: 1
       omni_kv_config:

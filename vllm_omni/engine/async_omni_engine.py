@@ -704,19 +704,7 @@ class AsyncOmniEngine:
             and isinstance(original_prompt, dict)
             and "img2img" in (original_prompt.get("modalities") or [])
         ):
-            prompt = _normalize_split_stage0_img2img_prompt(prompt)
-            if (
-                isinstance(prompt, dict)
-                and "multi_modal_uuids" in prompt
-                and "prompt" in prompt
-                and "prompt_token_ids" not in prompt
-            ):
-                prompt = dict(prompt)
-                tok_prompt = self.input_processor.renderer._tokenize_prompt(
-                    {"prompt": prompt["prompt"]},
-                    self.input_processor.renderer.default_cmpl_tok_params,
-                )
-                prompt["prompt_token_ids"] = tok_prompt["prompt_token_ids"]
+            prompt = self._prepare_split_stage0_img2img_prompt(prompt)
             params = self._build_split_parent_stage0_params(params)
             effective_sampling_params_list[0] = params
 
@@ -792,6 +780,9 @@ class AsyncOmniEngine:
             companion_sampling_params_list = list(sampling_params_list)
             companion_sampling_params_list[0] = companion_stage0_params
 
+            if isinstance(companion_prompt, dict) and "img2img" in (companion_prompt.get("modalities") or []):
+                companion_prompt = self._prepare_split_stage0_img2img_prompt(companion_prompt)
+
             # Run through same input processing as the main prompt
             if isinstance(companion_prompt, dict):
                 _inject_global_id(companion_prompt, cid)
@@ -830,6 +821,24 @@ class AsyncOmniEngine:
             len(expanded),
         )
 
+    def _prepare_split_stage0_img2img_prompt(self, prompt: Any) -> Any:
+        prompt = _normalize_split_stage0_img2img_prompt(prompt)
+        if (
+            not isinstance(prompt, dict)
+            or "multi_modal_uuids" not in prompt
+            or "prompt" not in prompt
+            or "prompt_token_ids" in prompt
+        ):
+            return prompt
+
+        prepared_prompt = dict(prompt)
+        tok_prompt = self.input_processor.renderer._tokenize_prompt(
+            {"prompt": prepared_prompt["prompt"]},
+            self.input_processor.renderer.default_cmpl_tok_params,
+        )
+        prepared_prompt["prompt_token_ids"] = tok_prompt["prompt_token_ids"]
+        return prepared_prompt
+
     @staticmethod
     def _build_split_parent_stage0_params(stage0_params: Any) -> Any:
         """Clone stage-0 sampling params for split image requests that only need KV.
@@ -856,10 +865,6 @@ class AsyncOmniEngine:
             parent_params.stop_token_ids = []
         if hasattr(parent_params, "include_stop_str_in_output"):
             parent_params.include_stop_str_in_output = False
-
-        extra_args = dict(getattr(parent_params, "extra_args", None) or {})
-        extra_args["split_stage0_prefill_only"] = True
-        parent_params.extra_args = extra_args
         return parent_params
 
     @staticmethod
@@ -871,12 +876,7 @@ class AsyncOmniEngine:
         AR generations long after their KV is ready, which delays parent
         forwarding on split Bagel paths.
         """
-        companion_params = AsyncOmniEngine._build_split_parent_stage0_params(stage0_params)
-
-        extra_args = dict(getattr(companion_params, "extra_args", None) or {})
-        extra_args["cfg_companion"] = True
-        companion_params.extra_args = extra_args
-        return companion_params
+        return AsyncOmniEngine._build_split_parent_stage0_params(stage0_params)
 
     @staticmethod
     def _get_default_cache_config(cache_backend: str | None) -> dict[str, Any] | None:
